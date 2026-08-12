@@ -1,0 +1,101 @@
+{
+  "generated_at": "2026-08-12T18:57:57Z",
+  "engine": "deterministic (no API key / no network used)",
+  "total_trials": 9,
+  "top1_accuracy": 0.3333333333333333,
+  "top3_accuracy": 0.3333333333333333,
+  "mean_confidence_when_correct": 0.5,
+  "mean_confidence_when_incorrect": null,
+  "scenarios": [
+    {
+      "name": "silent_dependency_bump",
+      "description": "A dependency swap silently changes tokenizer behavior underneath unrelated callers.",
+      "top1_accuracy": 1.0,
+      "top3_accuracy": 1.0,
+      "trials": 3,
+      "runs": [
+        {
+          "top1_correct": true,
+          "top3_correct": true,
+          "top_confidence": 0.5,
+          "predicted_sha": "67c03ab",
+          "guilty_sha": "67c03ab"
+        },
+        {
+          "top1_correct": true,
+          "top3_correct": true,
+          "top_confidence": 0.5,
+          "predicted_sha": "cdec3be",
+          "guilty_sha": "cdec3be"
+        },
+        {
+          "top1_correct": true,
+          "top3_correct": true,
+          "top_confidence": 0.5,
+          "predicted_sha": "216240c",
+          "guilty_sha": "216240c"
+        }
+      ]
+    },
+    {
+      "name": "removed_null_check",
+      "description": "A 'readability' refactor quietly drops an input-validation branch.",
+      "top1_accuracy": 0.0,
+      "top3_accuracy": 0.0,
+      "trials": 3,
+      "runs": [
+        {
+          "top1_correct": false,
+          "top3_correct": false,
+          "top_confidence": null,
+          "predicted_sha": null,
+          "guilty_sha": "fc136e9"
+        },
+        {
+          "top1_correct": false,
+          "top3_correct": false,
+          "top_confidence": null,
+          "predicted_sha": null,
+          "guilty_sha": "9058e38"
+        },
+        {
+          "top1_correct": false,
+          "top3_correct": false,
+          "top_confidence": null,
+          "predicted_sha": null,
+          "guilty_sha": "8c227b9"
+        }
+      ]
+    },
+    {
+      "name": "signature_change_breaks_caller",
+      "description": "A function's argument order changes but a caller is never updated.",
+      "top1_accuracy": 0.0,
+      "top3_accuracy": 0.0,
+      "trials": 3,
+      "runs": [
+        {
+          "top1_correct": false,
+          "top3_correct": false,
+          "top_confidence": null,
+          "predicted_sha": null,
+          "guilty_sha": "f50d53c"
+        },
+        {
+          "top1_correct": false,
+          "top3_correct": false,
+          "top_confidence": null,
+          "predicted_sha": null,
+          "guilty_sha": "94ebf58"
+        },
+        {
+          "top1_correct": false,
+          "top3_correct": false,
+          "top_confidence": null,
+          "predicted_sha": null,
+          "guilty_sha": "1e8a732"
+        }
+      ]
+    }
+  ]
+}

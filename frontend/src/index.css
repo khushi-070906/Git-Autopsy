@@ -1,0 +1,195 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+  /* --- A radiograph light table, powered off except where something's
+     lit. Cold cyan-white glow is the only "color," used like a film
+     read-out — not decoration. A muted clinical red appears once, only
+     when a cause is confirmed. No neon, no sticker fills, no stacked
+     accent hues. --- */
+  --bg: #05070a;
+  --panel: #0b1013;
+  --panel-lit: #0f1a1e;
+  --hairline: #1b262a;
+  --paper: #d9e7e8;
+  --dim: #5f7a7d;
+
+  --glow: #9fe3ec;      /* film-monitor cyan — the one live signal */
+  --finding: #d1493d;   /* muted clinical red — appears only at the cause */
+  --amber: #cf9c4a;
+  --violet: #9a8ad1;
+
+  --live: var(--glow);
+  --found: var(--finding);
+  --tag-fact: var(--glow);
+  --tag-evidence: var(--amber);
+  --tag-inference: var(--violet);
+  --tag-recommendation: var(--glow);
+  --risk-low: var(--glow);
+  --risk-medium: var(--amber);
+  --risk-high: var(--finding);
+
+  --font-display: 'Space Grotesk', -apple-system, sans-serif;
+  --font-body: 'IBM Plex Sans', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  background:
+    radial-gradient(900px 500px at 50% -10%, rgba(159, 227, 236, 0.06), transparent 60%),
+    var(--bg);
+  color: var(--paper);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+::selection { background: var(--glow); color: var(--bg); }
+a { color: var(--glow); }
+
+button {
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease;
+}
+button:disabled { cursor: not-allowed; }
+
+input { transition: border-color 140ms ease, box-shadow 140ms ease; }
+input:focus-visible {
+  border-color: var(--glow) !important;
+  box-shadow: 0 0 0 3px rgba(159, 227, 236, 0.14);
+}
+:focus-visible { outline: 1px solid var(--glow); outline-offset: 2px; }
+
+.mono-label {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 10.5px;
+  color: var(--dim);
+}
+
+.hairline { border-color: var(--hairline) !important; }
+
+.btn-primary {
+  border: 1px solid var(--glow) !important;
+}
+.btn-primary:hover:not(:disabled) { background: rgba(159, 227, 236, 0.1) !important; }
+.btn-primary:active:not(:disabled) { background: rgba(159, 227, 236, 0.2) !important; }
+
+.btn-ghost:hover:not(:disabled) { border-color: var(--glow) !important; color: var(--paper) !important; }
+
+/* Panels read as unlit film — flat, thin-edged, a hairline that catches
+   a touch of glow only on hover/focus, never a fill. */
+.stat-card, [data-panel] {
+  background: var(--panel) !important;
+  border: 1px solid var(--hairline) !important;
+  transition: border-color 160ms ease;
+}
+.stat-card { border-left: 2px solid var(--hairline) !important; }
+.stat-card:hover { border-color: var(--glow) !important; border-left-color: var(--glow) !important; }
+.stat-card .mono-label { color: var(--dim); }
+
+.suspect-row {
+  border: 1px solid var(--hairline) !important;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+.suspect-row:hover { border-color: var(--finding) !important; background: var(--panel-lit); }
+.suspect-row summary { list-style: none; }
+.suspect-row summary::-webkit-details-marker { display: none; }
+
+@keyframes shimmer { 0% { opacity: 0.3; } 50% { opacity: 1; } 100% { opacity: 0.3; } }
+.status-pulse { animation: shimmer 1.4s ease-in-out infinite; }
+
+@media (max-width: 860px) {
+  .stat-grid { grid-template-columns: repeat(2, 1fr) !important; }
+  .profile-grid { grid-template-columns: 1fr !important; }
+  .case-header { padding: 16px !important; }
+  h1 { font-size: 28px !important; }
+}
+@media (max-width: 520px) {
+  .stat-grid { grid-template-columns: 1fr !important; }
+  .intake-row { flex-direction: column !important; }
+  .intake-row button { width: 100%; }
+}
+
+/* Subject tag — plain mono chip, a single glow-lit dot instead of a
+   sticker or kraft card. */
+.toe-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  color: var(--paper);
+  border: 1px solid var(--hairline);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 6px 12px;
+  border-radius: 3px;
+}
+.toe-tag::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--glow);
+  box-shadow: 0 0 6px var(--glow);
+  flex-shrink: 0;
+}
+
+/* Film-strip sprockets — the one signature motif, a thin row of holes
+   along a panel's top edge, like 35mm stock feeding through a light
+   table. Used once per major surface, never stacked with other props. */
+.sprockets {
+  height: 10px;
+  background-image: radial-gradient(circle, var(--hairline) 2px, transparent 2.2px);
+  background-size: 16px 10px;
+  background-position: 6px center;
+  border-bottom: 1px solid var(--hairline);
+}
+
+/* Vitals monitor — a scan read-out on the light table: a glowing cyan
+   trace, no panel fill, just the line and its light. */
+.vitals-monitor {
+  position: relative;
+  width: 100%;
+  height: 58px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-top: none;
+}
+.vitals-monitor svg { display: block; filter: drop-shadow(0 0 5px currentColor); }
+.vitals-track { width: 200%; height: 100%; animation: vitals-scroll 3.2s linear infinite; }
+.vitals-track.is-flat { animation: none; }
+@keyframes vitals-scroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+.vitals-label {
+  position: absolute; top: 8px; left: 12px;
+  font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 0.12em; text-transform: uppercase;
+  z-index: 2;
+}
+.vitals-marker {
+  position: absolute; bottom: 8px; right: 12px;
+  font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 0.08em; z-index: 2;
+  padding: 2px 8px; border-radius: 3px;
+}
+
+.confidence-ring {
+  display: inline-flex; align-items: center; justify-content: center;
+  position: relative; width: 72px; height: 72px; flex-shrink: 0;
+}
+.confidence-ring svg { transform: rotate(-90deg); width: 100%; height: 100%; }
+.confidence-ring circle:nth-child(2) { filter: drop-shadow(0 0 4px currentColor); }
+.confidence-ring .ring-value {
+  position: absolute; font-family: var(--font-mono); font-weight: 600; font-size: 16px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

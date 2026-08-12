@@ -1,0 +1,15 @@
+fastapi==0.128.0
+uvicorn[standard]==0.34.0
+gitpython==3.1.59
+networkx==3.3
+pydantic==2.9.2
+sqlalchemy==2.0.35
+aiofiles==24.1.0
+slowapi==0.1.9
+
+# Optional AI layer (only needed if ANTHROPIC_API_KEY is set)
+anthropic==0.34.2
+
+# Dev/test
+pytest==8.3.3
+httpx==0.27.2

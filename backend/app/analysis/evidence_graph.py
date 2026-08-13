@@ -37,6 +37,13 @@ def build_evidence_graph(
     """
     g = nx.MultiDiGraph()
 
+    # Stash the repo path on the graph itself. WHY analysis (Signal 1) needs
+    # to re-read manifest file contents at specific commits (via
+    # dependency_parser.diff_dependency_manifest) to know exactly which
+    # package changed in a given commit, rather than just "a file called
+    # package.json was touched" — so it needs a way back to the checkout.
+    g.graph["repo_path"] = str(repo_path)
+
     # --- Commit and author nodes -----------------------------------------
     for c in commits:
         g.add_node(
@@ -47,6 +54,9 @@ def build_evidence_graph(
             author=c.author,
             date=c.date,
             message=c.message,
+            # Needed so WHY analysis can diff a manifest against the right
+            # parent commit instead of only knowing the file was touched.
+            parents=c.parents,
         )
         author_id = f"author:{c.author_email or c.author}"
         if author_id not in g:

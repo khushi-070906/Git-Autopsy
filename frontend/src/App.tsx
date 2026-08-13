@@ -36,8 +36,6 @@ export default function App() {
         const data = await getAnalysis(analysisId);
         setStatus(data.status);
         if (data.status === "completed") {
-          // Guard against a "completed" status arriving with no result body —
-          // that combination used to slip through and crash Dashboard on render.
           if (!data.result) {
             setError("Analysis completed but returned no data. Please try again.");
           } else {
@@ -213,11 +211,6 @@ function Landing({
 }
 
 function Dashboard({ result, onReset }: { result: AnalysisResult; onReset: () => void }) {
-  // Defensive defaults: the fields below are read from an external API
-  // response. If the backend omits a field, sends null, or the shape drifts,
-  // these guards keep the page rendering instead of throwing mid-render
-  // (which was silently unmounting the whole tree — the "loads then
-  // vanishes" symptom).
   const h = result.health ?? {
     repository_health_score: 0,
     risk_level: "LOW",
@@ -250,7 +243,6 @@ function Dashboard({ result, onReset }: { result: AnalysisResult; onReset: () =>
         </button>
       </div>
 
-      {/* Vitals */}
       <div style={{ marginBottom: 24 }}>
         <div className="sprockets" />
         <VitalsMonitor
@@ -260,7 +252,6 @@ function Dashboard({ result, onReset }: { result: AnalysisResult; onReset: () =>
         />
       </div>
 
-      {/* Overview */}
       <div className="stat-grid" style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, marginBottom: 28 }}>
         <StatCard label="Vital Signs Score" value={`${h.repository_health_score} / 100`} />
         <StatCard label="Triage Level" value={h.risk_level} color={RISK_COLOR[h.risk_level]} />
@@ -269,7 +260,6 @@ function Dashboard({ result, onReset }: { result: AnalysisResult; onReset: () =>
         <StatCard label="Suspicious Changes" value={String(h.suspicious_changes)} />
       </div>
 
-      {/* Root cause */}
       {result.top_root_cause && (
         <Section title="CAUSE OF FAILURE">
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14, flexWrap: "wrap", gap: 12 }}>
@@ -290,7 +280,6 @@ function Dashboard({ result, onReset }: { result: AnalysisResult; onReset: () =>
         </Section>
       )}
 
-      {/* All suspects — differential diagnosis */}
       <Section title={`DIFFERENTIAL DIAGNOSIS (${suspects.length})`}>
         {suspects.length === 0 && (
           <div style={{ color: "var(--dim)", fontSize: 13 }}>No commits crossed the diagnostic confidence threshold.</div>
@@ -311,13 +300,11 @@ function Dashboard({ result, onReset }: { result: AnalysisResult; onReset: () =>
         ))}
       </Section>
 
-      {/* Secondary findings */}
       <Section title="SECONDARY FINDINGS">
         <div style={{ fontSize: 13, color: "var(--dim)", marginBottom: 6 }}>{regressions.message}</div>
         <div style={{ fontSize: 12, color: "var(--dim)" }}>{regressions.note}</div>
       </Section>
 
-      {/* Dependency + language info */}
       <Section title="SUBJECT PROFILE">
         <div className="profile-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, fontSize: 13 }}>
           <div>
@@ -339,7 +326,6 @@ function Dashboard({ result, onReset }: { result: AnalysisResult; onReset: () =>
         </div>
       </Section>
 
-      {/* Evidence graph */}
       <Section title="SYSTEM ANATOMY">
         <EvidenceGraphView nodes={graph.nodes} edges={graph.edges} />
       </Section>

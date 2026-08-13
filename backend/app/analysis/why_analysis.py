@@ -18,9 +18,10 @@ Classification discipline (required by spec):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 
 import networkx as nx
+
+from app.analysis.dependency_parser import diff_dependency_manifest, _is_dev_dependency
 
 DEPENDENCY_MANIFESTS = {
     "requirements.txt", "pyproject.toml", "package.json",
@@ -49,7 +50,81 @@ class Suspect:
     recommendation: str = ""
 
 
-def _score_commit(g: nx.MultiDiGraph, commit_node: str) -> tuple[float, list[EvidenceItem], str]:
+def _score_dependency_signal(
+    g: nx.MultiDiGraph, commit_node: str, changed_deps: list[tuple[str, dict]]
+) -> tuple[float, list[EvidenceItem], list[str]]:
+    """
+    Signal 1: dependency manifest touched.
+
+    Fix: previously this scored purely on "a file named package.json was
+    touched", so a commit that only bumped a dev-tool like `prettier`
+    scored identically to one that bumped a runtime dependency like
+    `torch`. This now actually diffs the manifest content at this commit
+    vs. its parent (via git blob reads — no checkout, no execution) and
+    classifies each changed package as dev-only vs. runtime, weighting the
+    signal accordingly. Runtime dependency changes are a real regression
+    risk; dev-tooling changes (formatters, linters) essentially never are.
+    """
+    score = 0.0
+    evidence: list[EvidenceItem] = []
+    reasons: list[str] = []
+
+    if not changed_deps:
+        return score, evidence, reasons
+
+    repo_path = g.graph.get("repo_path")
+    commit_sha = g.nodes[commit_node].get("sha")
+    parents = g.nodes[commit_node].get("parents") or []
+    parent_sha = parents[0] if parents else None
+
+    runtime_changed: list[str] = []
+    dev_changed: list[str] = []
+
+    if repo_path and commit_sha:
+        for manifest_node, _ in changed_deps:
+            manifest_path = g.nodes[manifest_node].get("path", manifest_node)
+            try:
+                diff = diff_dependency_manifest(repo_path, commit_sha, parent_sha, manifest_path)
+            except Exception:
+                # Never let a blob-read failure crash scoring — fall back to
+                # the old coarse behavior (treat as an unclassified runtime
+                # change) for this manifest only.
+                dep_names = [g.nodes[v].get("path", v) for v, _ in changed_deps]
+                runtime_changed.extend(dep_names)
+                continue
+            for dep in diff["added"] + diff["removed"] + diff["changed"]:
+                target = dev_changed if _is_dev_dependency(dep) else runtime_changed
+                target.append(dep["name"])
+    else:
+        # No repo_path on the graph (e.g. an older graph built before this
+        # fix, or a test double) — fall back to the old coarse behavior
+        # rather than silently under-scoring.
+        dep_names = [g.nodes[v].get("path", v) for v, _ in changed_deps]
+        runtime_changed = dep_names
+
+    runtime_changed = list(dict.fromkeys(runtime_changed))
+    dev_changed = list(dict.fromkeys(dev_changed))
+
+    if runtime_changed:
+        score += 0.35
+        evidence.append(EvidenceItem(
+            "FACT", f"Runtime dependency changed: {', '.join(runtime_changed)}"
+        ))
+        reasons.append("a dependency manifest change")
+    elif dev_changed:
+        # Dev/build tooling (formatters, linters, type-checkers) almost
+        # never causes a runtime behavioral regression on its own.
+        score += 0.05
+        evidence.append(EvidenceItem(
+            "FACT", f"Dev-only dependency changed: {', '.join(dev_changed)}"
+        ))
+
+    return score, evidence, reasons
+
+
+def _score_commit(
+    g: nx.MultiDiGraph, commit_node: str
+) -> tuple[float, list[EvidenceItem], str]:
     """
     Score a single commit as a regression suspect using transparent,
     additive signals. Each signal that fires appends an EvidenceItem so the
@@ -67,23 +142,40 @@ def _score_commit(g: nx.MultiDiGraph, commit_node: str) -> tuple[float, list[Evi
         (v, d) for _, v, d in out_edges if d.get("kind") == "COMMIT_CHANGED_DEPENDENCY"
     ]
 
-    # Signal 1: dependency manifest touched — historically a common
-    # regression source (breaking API/behavior changes in third-party code).
-    if changed_deps:
-        score += 0.35
-        dep_names = [g.nodes[v].get("path", v) for v, _ in changed_deps]
-        evidence.append(EvidenceItem("FACT", f"Dependency manifest changed: {', '.join(dep_names)}"))
-        reasons.append("a dependency manifest change")
+    # Signal 1: dependency manifest touched (see _score_dependency_signal).
+    dep_score, dep_evidence, dep_reasons = _score_dependency_signal(g, commit_node, changed_deps)
+    score += dep_score
+    evidence.extend(dep_evidence)
+    reasons.extend(dep_reasons)
 
     # Signal 2: large diff (many insertions/deletions) — bigger surface area
     # for introducing unintended behavior change.
-    total_churn = sum(d.get("insertions", 0) + d.get("deletions", 0) for _, d in changed_files)
+    #
+    # Fix: a commit that is almost entirely *new* files (scaffolding —
+    # initial commits, "add CI/docs/docker" commits) trivially maximizes
+    # this signal without containing any modification to existing behavior.
+    # A regression by definition changes existing behavior, so we dampen
+    # the weight for diffs that are overwhelmingly additive-to-new-files.
+    total_insertions = sum(d.get("insertions", 0) for _, d in changed_files)
+    total_deletions = sum(d.get("deletions", 0) for _, d in changed_files)
+    total_churn = total_insertions + total_deletions
+    new_file_count = sum(1 for _, d in changed_files if d.get("change_type") == "A")
+    is_scaffolding = bool(changed_files) and (
+        new_file_count / len(changed_files) > 0.8
+        and total_deletions < 0.1 * (total_insertions + 1)
+    )
+
     if total_churn > 200:
-        score += 0.15
-        evidence.append(EvidenceItem("FACT", f"Large diff: {total_churn} lines changed across {len(changed_files)} files"))
+        weight = 0.05 if is_scaffolding else 0.15
+        score += weight
+        note = " (mostly new files — looks like scaffolding, not a modification)" if is_scaffolding else ""
+        evidence.append(EvidenceItem(
+            "FACT",
+            f"Large diff: {total_churn} lines changed across {len(changed_files)} files{note}",
+        ))
         reasons.append("an unusually large change")
     elif total_churn > 50:
-        score += 0.07
+        score += 0.03 if is_scaffolding else 0.07
 
     # Signal 3: commit message contains risk-signaling keywords.
     message = g.nodes[commit_node].get("message", "").lower()
@@ -125,16 +217,32 @@ def _score_commit(g: nx.MultiDiGraph, commit_node: str) -> tuple[float, list[Evi
     return score, evidence, summary
 
 
-def rank_suspects(g: nx.MultiDiGraph, top_n: int = 5, min_confidence: float = 0.2) -> list[Suspect]:
+def rank_suspects(
+    g: nx.MultiDiGraph,
+    top_n: int = 5,
+    min_confidence: float = 0.2,
+    has_test_framework: bool = True,
+) -> list[Suspect]:
     """
     Score every commit in the graph and return the top-N ranked by
     confidence, each carrying its own transparent evidence chain.
+
+    `has_test_framework`: when False (no test framework detected in the
+    repo at all — not even executed, just not present), the report has
+    zero ground truth to validate any of these heuristics against. Rather
+    than let the static score alone produce a number like "75% confidence"
+    that reads as near-certain, confidence is capped so the UI can't
+    overclaim on repos we have the least evidence about.
     """
     commit_nodes = [n for n, d in g.nodes(data=True) if d.get("kind") == "commit"]
     scored: list[Suspect] = []
 
     for cn in commit_nodes:
         score, evidence, summary = _score_commit(g, cn)
+
+        if not has_test_framework:
+            score = min(score, 0.40)
+
         if score < min_confidence:
             continue
 
@@ -144,6 +252,12 @@ def rank_suspects(g: nx.MultiDiGraph, top_n: int = 5, min_confidence: float = 0.
             for _, v, d in g.out_edges(cn, data=True)
             if d.get("kind") == "COMMIT_CHANGED_FILE"
         ]
+        # Fix: put dependency manifests first when they're present, since
+        # they're what the "likely cause" text and evidence actually name —
+        # previously the displayed file list could be a slice of the diff
+        # unrelated to the manifest the score/summary referenced.
+        affected_files.sort(key=lambda f: 0 if f in DEPENDENCY_MANIFESTS else 1)
+
         affected_functions = []
         for fpath in affected_files:
             file_id = f"file:{fpath}"

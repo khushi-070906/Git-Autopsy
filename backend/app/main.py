@@ -16,15 +16,6 @@ from app.database import Analysis, SessionLocal, get_session, init_db
 from app.pipeline import run_analysis
 from app.security import InvalidRepositoryURL, validate_github_url
 
-import subprocess
-
-@app.get("/version")
-def version():
-    try:
-        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, cwd="/app").stdout.strip()
-    except Exception:
-        sha = "unknown"
-    return {"commit": sha}
 
 
 @asynccontextmanager

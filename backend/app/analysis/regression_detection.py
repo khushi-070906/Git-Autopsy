@@ -28,13 +28,31 @@ def _suspect_to_dict(s: Suspect) -> dict:
     return d
 
 
-def detect_regressions(g: nx.MultiDiGraph, has_test_execution_data: bool = False) -> dict:
+def detect_regressions(
+    g: nx.MultiDiGraph,
+    has_test_execution_data: bool = False,
+    has_test_framework: bool = True,
+) -> dict:
+    """
+    `has_test_execution_data`: whether we have actual pass/fail history
+    (always False in V1 — no sandboxed execution engine yet).
+
+    `has_test_framework`: whether the repo even has a detected test
+    framework at all. Threaded through to rank_suspects so its confidence
+    cap applies here too — this endpoint used to be able to report a
+    50-75% "confidence" suspect even on a repo with zero test framework
+    present, which overstated how much the static heuristics actually
+    know.
+    """
     if not has_test_execution_data:
         return {
             "status": "insufficient_data",
             "message": "Insufficient historical test evidence.",
             "suspicious_changes": [
-                _suspect_to_dict(s) for s in rank_suspects(g, top_n=10, min_confidence=0.3)
+                _suspect_to_dict(s)
+                for s in rank_suspects(
+                    g, top_n=10, min_confidence=0.3, has_test_framework=has_test_framework
+                )
             ],
             "note": (
                 "No executed test-pass/fail history is available for this repository. "

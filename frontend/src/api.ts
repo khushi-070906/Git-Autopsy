@@ -41,6 +41,7 @@ export interface GraphEdge {
 }
 
 export interface AnalysisResult {
+  id: string;
   repo_url: string;
   language: { dominant_language: string; file_counts_by_language: Record<string, number> };
   dependency_files: string[];

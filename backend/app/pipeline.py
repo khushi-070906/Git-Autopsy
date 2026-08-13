@@ -59,12 +59,22 @@ def run_analysis(analysis_id: str, repo_url: str) -> None:
             else []
         )
 
+        # Fix: whether a test framework was even detected (not whether it
+        # was *executed* — we still have no sandboxed execution engine) is
+        # now used to cap suspect confidence. A repo with zero detected
+        # test tooling gives the static heuristics nothing to validate
+        # against, so the report shouldn't be able to claim 50-75%
+        # "confidence" the way it previously could.
+        has_test_framework = bool(test_frameworks)
+
         _update_status(analysis_id, "building_graph")
         g = evidence_graph.build_evidence_graph(repo_dir, commits, file_analyses)
 
         _update_status(analysis_id, "analyzing")
-        suspects = why_analysis.rank_suspects(g)
-        regressions = regression_detection.detect_regressions(g, has_test_execution_data=False)
+        suspects = why_analysis.rank_suspects(g, has_test_framework=has_test_framework)
+        regressions = regression_detection.detect_regressions(
+            g, has_test_execution_data=False, has_test_framework=has_test_framework
+        )
         health = regression_detection.compute_repository_health(g, suspects)
 
         top_root_cause = None

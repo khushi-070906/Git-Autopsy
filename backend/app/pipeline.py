@@ -13,6 +13,7 @@ from app.analysis import (
     evidence_graph,
     git_history,
     regression_detection,
+    static_js,
     static_python,
     why_analysis,
 )
@@ -38,6 +39,21 @@ def _update_status(analysis_id: str, status: str, error: str | None = None) -> N
         db.close()
 
 
+def _run_static_analysis(repo_dir, dominant_language: str) -> list:
+    """
+    Dispatches to the right static analyzer based on detected dominant
+    language. Previously this was Python-only (`else []`), which meant
+    JS/TS repos — the majority of real-world repos — got zero function-
+    level signal: Signal 4 in why_analysis.py ("changed code touches N
+    function(s) referenced by tests") never fired for them at all.
+    """
+    if dominant_language == "Python":
+        return static_python.analyze_repository_python_files(repo_dir)
+    if dominant_language in ("JavaScript", "TypeScript"):
+        return static_js.analyze_repository_js_files(repo_dir)
+    return []
+
+
 def run_analysis(analysis_id: str, repo_url: str) -> None:
     """
     Runs the full pipeline for one job. Called from a background task /
@@ -53,11 +69,7 @@ def run_analysis(analysis_id: str, repo_url: str) -> None:
         language_info = detect.detect_language(repo_dir)
         dep_files = detect.detect_dependency_files(repo_dir)
         test_frameworks = detect.detect_test_framework(repo_dir)
-        file_analyses = (
-            static_python.analyze_repository_python_files(repo_dir)
-            if language_info["dominant_language"] == "Python"
-            else []
-        )
+        file_analyses = _run_static_analysis(repo_dir, language_info["dominant_language"])
 
         # has_test_framework: True only for a real, named framework
         # (pytest, jest, ...). has_weak_test_signal: True when all we

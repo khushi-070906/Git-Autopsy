@@ -8,7 +8,6 @@ from __future__ import annotations
 import logging
 
 from app.analysis import (
-    ci_status,
     cloner,
     detect,
     evidence_graph,
@@ -22,6 +21,23 @@ from app.analysis.ai_layer import explain_suspect
 from app.database import Analysis, SessionLocal
 
 logger = logging.getLogger("autopsy.pipeline")
+
+# ci_status is imported defensively and separately from the rest of the
+# phase modules above. It's an optional, best-effort feature (real CI
+# status via GitHub's public Checks API) — a problem importing it (a
+# missing dependency, a bad edit, anything) must never prevent the whole
+# app from starting up. If the import fails, `ci_status` is left as None
+# and `_try_find_confirmed_regression` below short-circuits to "no
+# confirmed regression", exactly as if GitHub's API were unreachable.
+try:
+    from app.analysis import ci_status
+except ImportError:
+    ci_status = None
+    logging.getLogger("autopsy.pipeline").warning(
+        "ci_status module unavailable; CI-confirmed regressions disabled, "
+        "falling back to heuristics only",
+        exc_info=True,
+    )
 
 STATUS_SEQUENCE = ["queued", "cloning", "indexing", "building_graph", "analyzing", "completed"]
 
@@ -63,6 +79,8 @@ def _try_find_confirmed_regression(repo_url, commits, suspects):
     unexpected still slips through, the whole analysis falls back to
     heuristic-only behavior exactly as it did before this feature existed.
     """
+    if ci_status is None:
+        return None
     try:
         ci_status_by_sha = ci_status.annotate_suspects_with_ci(repo_url, suspects)
         return ci_status.find_confirmed_regression(repo_url, commits, ci_status_by_sha)

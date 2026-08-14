@@ -15,6 +15,9 @@ from sqlalchemy.orm import Session
 from app.database import Analysis, SessionLocal, get_session, init_db
 from app.pipeline import run_analysis
 from app.security import InvalidRepositoryURL, validate_github_url
+from app.analysis import badge
+
+app.include_router(badge.router)
 
 
 @asynccontextmanager

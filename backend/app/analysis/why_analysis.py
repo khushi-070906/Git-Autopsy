@@ -28,6 +28,12 @@ DEPENDENCY_MANIFESTS = {
     "package-lock.json", "poetry.lock", "Cargo.toml", "go.mod",
 }
 
+# Extensions that never indicate a runtime-behavior-affecting change on
+# their own — used to gate the "fix" keyword (see Signal 3) so a docs-only
+# commit that happens to say "fix the issue template" doesn't get treated
+# the same as a commit that says "fix null pointer in parser".
+NON_RISK_EXTENSIONS = {".md", ".txt", ".rst"}
+
 
 @dataclass
 class EvidenceItem:
@@ -56,14 +62,11 @@ def _score_dependency_signal(
     """
     Signal 1: dependency manifest touched.
 
-    Fix: previously this scored purely on "a file named package.json was
-    touched", so a commit that only bumped a dev-tool like `prettier`
-    scored identically to one that bumped a runtime dependency like
-    `torch`. This now actually diffs the manifest content at this commit
-    vs. its parent (via git blob reads — no checkout, no execution) and
-    classifies each changed package as dev-only vs. runtime, weighting the
-    signal accordingly. Runtime dependency changes are a real regression
-    risk; dev-tooling changes (formatters, linters) essentially never are.
+    Actually diffs the manifest content at this commit vs. its parent (via
+    git blob reads — no checkout, no execution) and classifies each changed
+    package as dev-only vs. runtime, weighting the signal accordingly.
+    Runtime dependency changes are a real regression risk; dev-tooling
+    changes (formatters, linters) essentially never are.
     """
     score = 0.0
     evidence: list[EvidenceItem] = []
@@ -86,9 +89,6 @@ def _score_dependency_signal(
             try:
                 diff = diff_dependency_manifest(repo_path, commit_sha, parent_sha, manifest_path)
             except Exception:
-                # Never let a blob-read failure crash scoring — fall back to
-                # the old coarse behavior (treat as an unclassified runtime
-                # change) for this manifest only.
                 dep_names = [g.nodes[v].get("path", v) for v, _ in changed_deps]
                 runtime_changed.extend(dep_names)
                 continue
@@ -96,9 +96,6 @@ def _score_dependency_signal(
                 target = dev_changed if _is_dev_dependency(dep) else runtime_changed
                 target.append(dep["name"])
     else:
-        # No repo_path on the graph (e.g. an older graph built before this
-        # fix, or a test double) — fall back to the old coarse behavior
-        # rather than silently under-scoring.
         dep_names = [g.nodes[v].get("path", v) for v, _ in changed_deps]
         runtime_changed = dep_names
 
@@ -112,8 +109,6 @@ def _score_dependency_signal(
         ))
         reasons.append("a dependency manifest change")
     elif dev_changed:
-        # Dev/build tooling (formatters, linters, type-checkers) almost
-        # never causes a runtime behavioral regression on its own.
         score += 0.05
         evidence.append(EvidenceItem(
             "FACT", f"Dev-only dependency changed: {', '.join(dev_changed)}"
@@ -148,14 +143,7 @@ def _score_commit(
     evidence.extend(dep_evidence)
     reasons.extend(dep_reasons)
 
-    # Signal 2: large diff (many insertions/deletions) — bigger surface area
-    # for introducing unintended behavior change.
-    #
-    # Fix: a commit that is almost entirely *new* files (scaffolding —
-    # initial commits, "add CI/docs/docker" commits) trivially maximizes
-    # this signal without containing any modification to existing behavior.
-    # A regression by definition changes existing behavior, so we dampen
-    # the weight for diffs that are overwhelmingly additive-to-new-files.
+    # Signal 2: large diff, dampened for scaffolding-style commits.
     total_insertions = sum(d.get("insertions", 0) for _, d in changed_files)
     total_deletions = sum(d.get("deletions", 0) for _, d in changed_files)
     total_churn = total_insertions + total_deletions
@@ -178,17 +166,31 @@ def _score_commit(
         score += 0.03 if is_scaffolding else 0.07
 
     # Signal 3: commit message contains risk-signaling keywords.
+    #
+    # Fix: "fix" alone is too noisy — it fires on purely doc/template
+    # commits (e.g. "Fix .github/ISSUE_TEMPLATE from bare file to proper
+    # directory") that have nothing to do with a code regression. Only
+    # count "fix" as a risk signal if the commit also touches a file that
+    # isn't just docs/text — every other keyword here (revert, hack,
+    # workaround, hotfix, upgrade, bump) is specific enough to keep as-is.
     message = g.nodes[commit_node].get("message", "").lower()
-    risk_keywords = ["upgrade", "bump", "update dep", "fix", "revert", "hack", "workaround", "hotfix"]
-    hit_keywords = [k for k in risk_keywords if k in message]
+    always_risky_keywords = ["upgrade", "bump", "update dep", "revert", "hack", "workaround", "hotfix"]
+    hit_keywords = [k for k in always_risky_keywords if k in message]
+
+    if "fix" in message:
+        non_doc_touched = any(
+            not any(g.nodes[v].get("path", v).endswith(ext) for ext in NON_RISK_EXTENSIONS)
+            for v, _ in changed_files
+        )
+        if non_doc_touched:
+            hit_keywords.append("fix")
+
     if hit_keywords:
         score += 0.15
         evidence.append(EvidenceItem("FACT", f"Commit message contains risk-signaling terms: {', '.join(hit_keywords)}"))
         reasons.append("wording in the commit message")
 
-    # Signal 4: touches files that are known to feed tests (higher blast
-    # radius / more likely to be caught, but also more likely a genuine
-    # behavioral change if it precedes failures).
+    # Signal 4: touches files that are known to feed tests.
     tested_functions_touched = 0
     for fpath, _ in changed_files:
         for _, fn, edata in g.out_edges(fpath, data=True):
@@ -202,10 +204,6 @@ def _score_commit(
             f"Changed code touches {tested_functions_touched} function(s) referenced by tests",
         ))
         reasons.append("changes to test-covered functions")
-
-    # Signal 5: authored by a single-commit contributor touching core files
-    # (weak signal, small weight) — omitted from MVP scoring to avoid
-    # unfounded bias against new contributors; left as future work.
 
     score = min(score, 0.97)  # never claim near-certainty from heuristics alone
 
@@ -222,17 +220,22 @@ def rank_suspects(
     top_n: int = 5,
     min_confidence: float = 0.2,
     has_test_framework: bool = True,
+    has_weak_test_signal: bool = False,
 ) -> list[Suspect]:
     """
     Score every commit in the graph and return the top-N ranked by
     confidence, each carrying its own transparent evidence chain.
 
-    `has_test_framework`: when False (no test framework detected in the
-    repo at all — not even executed, just not present), the report has
-    zero ground truth to validate any of these heuristics against. Rather
-    than let the static score alone produce a number like "75% confidence"
-    that reads as near-certain, confidence is capped so the UI can't
-    overclaim on repos we have the least evidence about.
+    `has_test_framework`: True only when a real, named test framework was
+    detected (pytest, jest, etc.) — not just a bare `tests/` directory.
+    When False, confidence is capped since there's no real ground truth to
+    validate the static heuristics against.
+
+    `has_weak_test_signal`: True when detect_test_framework() found only a
+    generic test directory ("unknown (test directory present)") with no
+    actual framework markers. This is weaker evidence than a real
+    framework but still more than nothing, so it gets a looser cap (55%)
+    than the no-signal-at-all case (40%).
     """
     commit_nodes = [n for n, d in g.nodes(data=True) if d.get("kind") == "commit"]
     scored: list[Suspect] = []
@@ -241,7 +244,8 @@ def rank_suspects(
         score, evidence, summary = _score_commit(g, cn)
 
         if not has_test_framework:
-            score = min(score, 0.40)
+            cap = 0.55 if has_weak_test_signal else 0.40
+            score = min(score, cap)
 
         if score < min_confidence:
             continue
@@ -252,10 +256,6 @@ def rank_suspects(
             for _, v, d in g.out_edges(cn, data=True)
             if d.get("kind") == "COMMIT_CHANGED_FILE"
         ]
-        # Fix: put dependency manifests first when they're present, since
-        # they're what the "likely cause" text and evidence actually name —
-        # previously the displayed file list could be a slice of the diff
-        # unrelated to the manifest the score/summary referenced.
         affected_files.sort(key=lambda f: 0 if f in DEPENDENCY_MANIFESTS else 1)
 
         affected_functions = []

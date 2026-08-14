@@ -1,18 +1,15 @@
 """
 Phase 7 — Regression detection.
 
-V1 has no sandboxed test-execution engine (spec requires that to be a
-clearly separated, optional feature — not implemented in this MVP). Without
-executed test history, AUTOPSY cannot claim to know which tests failed when.
-Per spec, it must say so explicitly instead of fabricating regression
-evidence.
-
-What it CAN do deterministically from git history alone:
-  - flag commits that touch dependency manifests (potential regression
-    triggers)
-  - flag commits with large, high-risk diffs
-  - surface these as "suspicious changes", clearly labeled as unconfirmed
-    without executed test evidence
+Without executed test history, AUTOPSY previously could only ever report
+"insufficient_data" — static heuristics flagging PLAUSIBLE triggers, never
+a confirmed cause. This module now accepts an optional `confirmed_regression`
+(produced by ci_status.find_confirmed_regression from real GitHub Actions /
+Checks API data) — when one is found, the response reports a genuine
+last-passing -> first-failing transition instead of only a static guess.
+This only applies to repos that actually have CI configured and that
+AUTOPSY was able to reach GitHub's API for; everything else still falls
+back to the original heuristic-only behavior unchanged.
 """
 from __future__ import annotations
 
@@ -33,31 +30,48 @@ def detect_regressions(
     has_test_execution_data: bool = False,
     has_test_framework: bool = True,
     has_weak_test_signal: bool = False,
+    confirmed_regression: dict | None = None,
 ) -> dict:
     """
-    `has_test_execution_data`: whether we have actual pass/fail history
-    (always False in V1 — no sandboxed execution engine yet).
+    `has_test_execution_data`: whether we ran tests ourselves in a sandbox
+    (still always False — AUTOPSY has no sandboxed execution engine).
 
-    `has_test_framework` / `has_weak_test_signal`: threaded through to
-    rank_suspects so its confidence cap applies here too. A real detected
-    framework (pytest, jest, ...) gets no cap; a bare test directory with
-    no framework markers gets a looser cap (55%) than a repo with no test
-    signal at all (40%).
+    `confirmed_regression`: optional dict from
+    ci_status.find_confirmed_regression, containing a real last-passing ->
+    first-failing transition sourced from GitHub's Checks API. When
+    present, this is genuine evidence — not a static guess — so it's
+    surfaced distinctly with status "confirmed" rather than folded into
+    the "PLAUSIBLE... not confirmed" heuristic list.
     """
+    heuristic_suspects = rank_suspects(
+        g, top_n=10, min_confidence=0.3,
+        has_test_framework=has_test_framework,
+        has_weak_test_signal=has_weak_test_signal,
+    )
+
+    if confirmed_regression is not None:
+        return {
+            "status": "confirmed",
+            "message": (
+                f"Confirmed via GitHub CI history: commit {confirmed_regression['short_sha']} "
+                f"is the first commit where CI failed after commit "
+                f"{confirmed_regression['last_passing_short_sha']} last passed."
+            ),
+            "confirmed_regression": confirmed_regression,
+            "suspicious_changes": [_suspect_to_dict(s) for s in heuristic_suspects],
+            "note": (
+                "The confirmed_regression field above is sourced from real GitHub Actions / "
+                "Checks API results — a genuine pass/fail transition, not a static-heuristic "
+                "guess. The suspicious_changes list below is still the same PLAUSIBLE-trigger "
+                "heuristic ranking as always, included for context."
+            ),
+        }
+
     if not has_test_execution_data:
         return {
             "status": "insufficient_data",
             "message": "Insufficient historical test evidence.",
-            "suspicious_changes": [
-                _suspect_to_dict(s)
-                for s in rank_suspects(
-                    g,
-                    top_n=10,
-                    min_confidence=0.3,
-                    has_test_framework=has_test_framework,
-                    has_weak_test_signal=has_weak_test_signal,
-                )
-            ],
+            "suspicious_changes": [_suspect_to_dict(s) for s in heuristic_suspects],
             "note": (
                 "No executed test-pass/fail history is available for this repository. "
                 "The items below are commits flagged by static heuristics (dependency "

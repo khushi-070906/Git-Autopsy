@@ -4,7 +4,6 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 
-
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,14 +16,6 @@ from app.database import Analysis, SessionLocal, get_session, init_db
 from app.pipeline import run_analysis
 from app.security import InvalidRepositoryURL, validate_github_url
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
-
-
-@app.get("/version")
-def version():
-    return {"commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA", "unknown")}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -147,3 +138,14 @@ def get_history(analysis_id: str, db: Session = Depends(get_session)):
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.get("/version")
+def version():
+    """
+    Returns the deployed commit SHA. Railway sets RAILWAY_GIT_COMMIT_SHA
+    automatically — this exists purely so a deploy can be verified with a
+    single GET instead of comparing evidence-text phrasing or digging
+    through build/runtime logs to infer whether a push actually went live.
+    """
+    return {"commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA", "unknown")}

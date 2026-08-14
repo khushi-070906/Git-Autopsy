@@ -4,12 +4,11 @@ Phase 5 — Dependency manifest parsing.
 Parses manifest files into (name, version_spec) pairs. Never installs
 anything; only reads and parses text.
 
-Also provides per-commit manifest diffing (Fix, see below) so the WHY
-analysis can know exactly which package(s) changed in a given commit,
-rather than just "this commit touched a file named package.json" —
-and can tell a dev-only tool (prettier, eslint, ...) apart from a
-runtime dependency (torch, fastapi, ...) that can actually cause a
-behavioral regression.
+Also provides per-commit manifest diffing (diff_dependency_manifest) so the
+WHY analysis can know exactly which package(s) changed in a given commit,
+classify dev-only vs. runtime, and — new in this round — classify a
+version *change* by severity (major/minor/patch) so a breaking-looking
+major bump can be weighted higher than a routine patch bump.
 """
 from __future__ import annotations
 
@@ -101,12 +100,6 @@ PARSERS = {
     "Cargo.toml": parse_cargo_toml,
 }
 
-# Packages that are dev/build-tooling only and essentially never cause a
-# runtime behavioral regression on their own. Used to downweight the
-# "dependency changed" signal in why_analysis when only tooling like this
-# moved. This list is intentionally conservative — false negatives here
-# (a real runtime package we fail to recognize) just fall back to full
-# weight, which is the safe default.
 DEV_ONLY_TOOLS = {
     "prettier", "eslint", "black", "flake8", "mypy", "ruff", "pytest",
     "pytest-cov", "isort", "pylint", "husky", "lint-staged", "nodemon",
@@ -115,15 +108,6 @@ DEV_ONLY_TOOLS = {
 
 
 def _is_dev_dependency(dep: dict) -> bool:
-    """
-    True if a parsed dependency dict is dev/build-tooling only.
-
-    package.json deps carry an explicit "dev" flag from parse_package_json.
-    requirements.txt has no such concept, so we fall back to a name
-    allowlist of well-known dev-only tools; anything not recognized is
-    treated as a runtime dependency (safe default — don't under-weight
-    something we don't recognize).
-    """
     if dep.get("dev") is True:
         return True
     return dep.get("name", "").lower() in DEV_ONLY_TOOLS
@@ -149,17 +133,13 @@ def diff_dependency_manifest(
     """
     Return which dependencies were added / removed / changed in `manifest_path`
     between `parent_sha` and `sha`, using git blob reads (no checkout, no
-    execution). This is what lets the WHY analysis know it was specifically
-    `prettier` (a dev tool) vs. `torch` (a runtime dependency) that changed
-    in a given commit, instead of just "package.json was touched".
+    execution).
 
     Returns {"added": [...], "removed": [...], "changed": [...]} where each
-    entry is a dependency dict as produced by the relevant parser.
+    entry is a dependency dict as produced by the relevant parser. Each
+    "changed" entry additionally carries "old_version" so callers can
+    classify bump severity via classify_version_bump().
     """
-    # Local import to avoid a circular import at module load time
-    # (git_history doesn't depend on dependency_parser, but keeping this
-    # import local mirrors the existing style used for the optional
-    # AI layer's `import anthropic`).
     from app.analysis.git_history import get_file_content_at_commit
 
     filename = manifest_path.rsplit("/", 1)[-1]
@@ -178,8 +158,56 @@ def diff_dependency_manifest(
 
     added = [curr[n] for n in (curr.keys() - prev.keys())]
     removed = [prev[n] for n in (prev.keys() - curr.keys())]
-    changed = [
-        curr[n] for n in (curr.keys() & prev.keys())
-        if curr[n].get("version") != prev[n].get("version")
-    ]
+    changed = []
+    for n in (curr.keys() & prev.keys()):
+        if curr[n].get("version") != prev[n].get("version"):
+            entry = dict(curr[n])
+            entry["old_version"] = prev[n].get("version", "")
+            changed.append(entry)
+
     return {"added": added, "removed": removed, "changed": changed}
+
+
+def _clean_version_parts(v: str) -> list[int] | None:
+    """
+    Strip common version-spec prefixes (^, ~, >=, ==, etc.) and pull out up
+    to 3 leading numeric components. Returns None if nothing numeric could
+    be extracted (e.g. a git-ref version, an empty string, "latest").
+    """
+    if not v:
+        return None
+    v = v.strip()
+    v = re.sub(r"^[~^=<>! ]+", "", v)
+    parts = re.split(r"[.\-+]", v)
+    nums: list[int] = []
+    for p in parts[:3]:
+        m = re.match(r"^(\d+)", p)
+        if not m:
+            break
+        nums.append(int(m.group(1)))
+    return nums or None
+
+
+def classify_version_bump(old_version: str, new_version: str) -> str:
+    """
+    Classify a version change as "major", "minor", "patch", "same", or
+    "unknown" (when either version string can't be parsed as numeric
+    semver-like components — e.g. a git URL, a branch name, "latest").
+
+    Used to weight the dependency-change signal: a major-version bump on a
+    runtime dependency is a much stronger regression risk than a patch
+    bump, so they shouldn't score identically.
+    """
+    old_nums = _clean_version_parts(old_version)
+    new_nums = _clean_version_parts(new_version)
+    if old_nums is None or new_nums is None:
+        return "unknown"
+    old_nums = old_nums + [0] * (3 - len(old_nums))
+    new_nums = new_nums + [0] * (3 - len(new_nums))
+    if old_nums[0] != new_nums[0]:
+        return "major"
+    if old_nums[1] != new_nums[1]:
+        return "minor"
+    if old_nums[2] != new_nums[2]:
+        return "patch"
+    return "same"

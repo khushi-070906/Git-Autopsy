@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 
 from app.analysis import (
+    ci_status,
     cloner,
     detect,
     evidence_graph,
@@ -42,16 +43,32 @@ def _update_status(analysis_id: str, status: str, error: str | None = None) -> N
 def _run_static_analysis(repo_dir, dominant_language: str) -> list:
     """
     Dispatches to the right static analyzer based on detected dominant
-    language. Previously this was Python-only (`else []`), which meant
-    JS/TS repos — the majority of real-world repos — got zero function-
-    level signal: Signal 4 in why_analysis.py ("changed code touches N
-    function(s) referenced by tests") never fired for them at all.
+    language.
     """
     if dominant_language == "Python":
         return static_python.analyze_repository_python_files(repo_dir)
     if dominant_language in ("JavaScript", "TypeScript"):
         return static_js.analyze_repository_js_files(repo_dir)
     return []
+
+
+def _try_find_confirmed_regression(repo_url, commits, suspects):
+    """
+    Best-effort real-CI lookup via GitHub's public Checks API. This is a
+    network call to a third-party API on every analysis run — any failure
+    mode here (rate limit, network error, repo has no CI, unexpected
+    response shape) must NEVER abort the analysis. ci_status.py already
+    catches everything internally and returns "unknown" rather than
+    raising, but this wrapper is a second, cheap safety net: if anything
+    unexpected still slips through, the whole analysis falls back to
+    heuristic-only behavior exactly as it did before this feature existed.
+    """
+    try:
+        ci_status_by_sha = ci_status.annotate_suspects_with_ci(repo_url, suspects)
+        return ci_status.find_confirmed_regression(repo_url, commits, ci_status_by_sha)
+    except Exception:
+        logger.warning("CI status lookup failed for %s; falling back to heuristics only", repo_url, exc_info=True)
+        return None
 
 
 def run_analysis(analysis_id: str, repo_url: str) -> None:
@@ -71,12 +88,6 @@ def run_analysis(analysis_id: str, repo_url: str) -> None:
         test_frameworks = detect.detect_test_framework(repo_dir)
         file_analyses = _run_static_analysis(repo_dir, language_info["dominant_language"])
 
-        # has_test_framework: True only for a real, named framework
-        # (pytest, jest, ...). has_weak_test_signal: True when all we
-        # found was a bare test directory with no framework markers —
-        # weaker evidence than a real framework, but more than nothing,
-        # so it gets a looser confidence cap downstream than "no signal
-        # at all".
         real_frameworks = [f for f in test_frameworks if not f.startswith("unknown")]
         has_test_framework = bool(real_frameworks)
         has_weak_test_signal = bool(test_frameworks) and not has_test_framework
@@ -90,11 +101,18 @@ def run_analysis(analysis_id: str, repo_url: str) -> None:
             has_test_framework=has_test_framework,
             has_weak_test_signal=has_weak_test_signal,
         )
+
+        # Best-effort: look up real CI status for the top suspects via
+        # GitHub's public Checks API. Never allowed to fail the analysis —
+        # see _try_find_confirmed_regression's docstring.
+        confirmed_regression = _try_find_confirmed_regression(repo_url, commits, suspects)
+
         regressions = regression_detection.detect_regressions(
             g,
             has_test_execution_data=False,
             has_test_framework=has_test_framework,
             has_weak_test_signal=has_weak_test_signal,
+            confirmed_regression=confirmed_regression,
         )
         health = regression_detection.compute_repository_health(g, suspects)
 
@@ -120,6 +138,7 @@ def run_analysis(analysis_id: str, repo_url: str) -> None:
             "test_frameworks": test_frameworks,
             "health": health,
             "top_root_cause": top_root_cause,
+            "confirmed_regression": confirmed_regression,
             "suspects": [
                 {
                     "commit_sha": s.commit_sha,

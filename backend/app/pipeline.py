@@ -59,21 +59,30 @@ def run_analysis(analysis_id: str, repo_url: str) -> None:
             else []
         )
 
-        # Fix: whether a test framework was even detected (not whether it
-        # was *executed* — we still have no sandboxed execution engine) is
-        # now used to cap suspect confidence. A repo with zero detected
-        # test tooling gives the static heuristics nothing to validate
-        # against, so the report shouldn't be able to claim 50-75%
-        # "confidence" the way it previously could.
-        has_test_framework = bool(test_frameworks)
+        # has_test_framework: True only for a real, named framework
+        # (pytest, jest, ...). has_weak_test_signal: True when all we
+        # found was a bare test directory with no framework markers —
+        # weaker evidence than a real framework, but more than nothing,
+        # so it gets a looser confidence cap downstream than "no signal
+        # at all".
+        real_frameworks = [f for f in test_frameworks if not f.startswith("unknown")]
+        has_test_framework = bool(real_frameworks)
+        has_weak_test_signal = bool(test_frameworks) and not has_test_framework
 
         _update_status(analysis_id, "building_graph")
         g = evidence_graph.build_evidence_graph(repo_dir, commits, file_analyses)
 
         _update_status(analysis_id, "analyzing")
-        suspects = why_analysis.rank_suspects(g, has_test_framework=has_test_framework)
+        suspects = why_analysis.rank_suspects(
+            g,
+            has_test_framework=has_test_framework,
+            has_weak_test_signal=has_weak_test_signal,
+        )
         regressions = regression_detection.detect_regressions(
-            g, has_test_execution_data=False, has_test_framework=has_test_framework
+            g,
+            has_test_execution_data=False,
+            has_test_framework=has_test_framework,
+            has_weak_test_signal=has_weak_test_signal,
         )
         health = regression_detection.compute_repository_health(g, suspects)
 

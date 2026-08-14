@@ -21,12 +21,21 @@ Design constraints:
   - Bounded: only checks the commits actually surfaced as suspects (not
     the full history) to stay well within the unauthenticated rate limit
     on a single analysis run.
+  - Zero third-party dependencies. Uses only Python's stdlib (urllib).
+    A previous version imported `requests` at module level, which meant
+    that if `requests` wasn't installed in the deploy environment, the
+    top-level `from app.analysis import (..., ci_status, ...)` in
+    pipeline.py would raise ModuleNotFoundError at *import time* — before
+    any of this module's careful error handling ever ran — and crash the
+    whole app on boot rather than just degrading one analysis job. Using
+    only the stdlib removes that failure mode entirely.
 """
 from __future__ import annotations
 
+import json
 import re
-
-import requests
+import urllib.error
+import urllib.request
 
 GITHUB_API_BASE = "https://api.github.com"
 REQUEST_TIMEOUT_SECONDS = 8
@@ -55,6 +64,41 @@ def _parse_owner_repo(repo_url: str) -> tuple[str, str] | None:
     return m.group(1), m.group(2)
 
 
+def _get_json(url: str) -> tuple[int, dict | None]:
+    """
+    GET a URL and return (status_code, parsed_json_or_None). Every failure
+    mode — network error, timeout, non-200, bad JSON — is caught here and
+    turned into a plain (status_code, None) or (0, None) so callers never
+    need their own try/except around this.
+    """
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "autopsy-ci-status",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+            status = resp.getcode()
+            body = resp.read()
+    except urllib.error.HTTPError as e:
+        # 404 (no checks for this commit), 403 (rate limited), 422, etc. —
+        # still a well-formed HTTP response, just not a 2xx.
+        return e.code, None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        # DNS failure, connection refused, timeout, etc.
+        return 0, None
+
+    if status != 200:
+        return status, None
+
+    try:
+        return status, json.loads(body)
+    except (ValueError, TypeError):
+        return status, None
+
+
 def fetch_commit_ci_status(repo_url: str, sha: str) -> str:
     """
     Returns one of: "passed", "failed", "inconclusive", "unknown".
@@ -71,23 +115,8 @@ def fetch_commit_ci_status(repo_url: str, sha: str) -> str:
     owner, repo = parsed
 
     url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/commits/{sha}/check-runs"
-    try:
-        resp = requests.get(
-            url,
-            headers={"Accept": "application/vnd.github+json"},
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-    except requests.RequestException:
-        return "unknown"
-
-    if resp.status_code != 200:
-        # 404 (no checks for this commit), 403 (rate limited), 422, etc. —
-        # all treated the same: no usable CI data for this commit.
-        return "unknown"
-
-    try:
-        data = resp.json()
-    except ValueError:
+    _status, data = _get_json(url)
+    if data is None:
         return "unknown"
 
     check_runs = data.get("check_runs", [])

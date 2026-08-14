@@ -4,6 +4,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 
+
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -16,7 +17,14 @@ from app.database import Analysis, SessionLocal, get_session, init_db
 from app.pipeline import run_analysis
 from app.security import InvalidRepositoryURL, validate_github_url
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
+
+@app.get("/version")
+def version():
+    return {"commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA", "unknown")}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

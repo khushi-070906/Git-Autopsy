@@ -17,8 +17,6 @@ from app.pipeline import run_analysis
 from app.security import InvalidRepositoryURL, validate_github_url
 from app.analysis import badge
 
-app.include_router(badge.router)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -27,6 +25,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AUTOPSY", description="Forensic analysis for software.", lifespan=lifespan)
+
+app.include_router(badge.router)
 
 # ALLOWED_ORIGINS is a comma-separated list of exact origins, e.g.
 # "https://autopsy.example.com,https://staging.autopsy.example.com".

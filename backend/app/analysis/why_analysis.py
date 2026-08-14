@@ -21,18 +21,41 @@ from dataclasses import dataclass, field
 
 import networkx as nx
 
-from app.analysis.dependency_parser import diff_dependency_manifest, _is_dev_dependency
+from app.analysis.dependency_parser import (
+    classify_version_bump,
+    diff_dependency_manifest,
+    _is_dev_dependency,
+)
 
 DEPENDENCY_MANIFESTS = {
     "requirements.txt", "pyproject.toml", "package.json",
     "package-lock.json", "poetry.lock", "Cargo.toml", "go.mod",
 }
 
-# Extensions that never indicate a runtime-behavior-affecting change on
-# their own — used to gate the "fix" keyword (see Signal 3) so a docs-only
-# commit that happens to say "fix the issue template" doesn't get treated
-# the same as a commit that says "fix null pointer in parser".
 NON_RISK_EXTENSIONS = {".md", ".txt", ".rst"}
+
+# Weight applied per bump severity when a runtime dependency's *version*
+# changes (as opposed to being freshly added/removed). A major bump is far
+# more likely to introduce a breaking behavior change than a patch bump.
+BUMP_SEVERITY_WEIGHT = {
+    "major": 0.35,
+    "minor": 0.22,
+    "patch": 0.10,
+    "same": 0.0,
+    "unknown": 0.25,  # can't tell — treat as moderately risky, not zero
+}
+
+# A file touched this many times or more across the reviewed commit history
+# is a "hotspot" — historically more prone to change, so a further change
+# to it is treated as a (small) elevated risk relative to a file touched
+# once. This is a coarse heuristic, not a claim of causation.
+HOTSPOT_THRESHOLD = 5
+
+# An author with this many or fewer commits in the reviewed history is
+# treated as a newer contributor for the purposes of Signal 6. Deliberately
+# small and additive-only (not punitive) — the goal is a mild signal, not
+# bias against new contributors.
+NEW_CONTRIBUTOR_COMMIT_THRESHOLD = 1
 
 
 @dataclass
@@ -56,17 +79,43 @@ class Suspect:
     recommendation: str = ""
 
 
+def _compute_repo_stats(g: nx.MultiDiGraph) -> dict:
+    """
+    One pass over the whole graph to build aggregate stats used by
+    per-commit signals that need history-wide context (file churn counts,
+    per-author commit counts) rather than just this-commit-only facts.
+    Computed once per rank_suspects() call, not once per commit.
+    """
+    file_churn: dict[str, int] = {}
+    author_counts: dict[str, int] = {}
+
+    for _, d in g.nodes(data=True):
+        if d.get("kind") == "commit":
+            author = d.get("author", "unknown")
+            author_counts[author] = author_counts.get(author, 0) + 1
+
+    for _, v, d in g.edges(data=True):
+        if d.get("kind") == "COMMIT_CHANGED_FILE":
+            fpath = g.nodes[v].get("path", v)
+            file_churn[fpath] = file_churn.get(fpath, 0) + 1
+
+    return {"file_churn": file_churn, "author_counts": author_counts}
+
+
 def _score_dependency_signal(
     g: nx.MultiDiGraph, commit_node: str, changed_deps: list[tuple[str, dict]]
 ) -> tuple[float, list[EvidenceItem], list[str]]:
     """
     Signal 1: dependency manifest touched.
 
-    Actually diffs the manifest content at this commit vs. its parent (via
-    git blob reads — no checkout, no execution) and classifies each changed
-    package as dev-only vs. runtime, weighting the signal accordingly.
-    Runtime dependency changes are a real regression risk; dev-tooling
-    changes (formatters, linters) essentially never are.
+    Diffs the manifest content at this commit vs. its parent, classifies
+    each changed package as dev-only vs. runtime, and — new in this round —
+    for packages whose *version* changed (not just added/removed), weights
+    by bump severity (major/minor/patch) via classify_version_bump(). A
+    freshly added or removed runtime dependency gets a flat moderate
+    weight, since "added" can't by itself have changed behavior of code
+    that doesn't use it yet (Signal 4 separately catches whether the diff
+    also touches code that consumes it).
     """
     score = 0.0
     evidence: list[EvidenceItem] = []
@@ -80,7 +129,8 @@ def _score_dependency_signal(
     parents = g.nodes[commit_node].get("parents") or []
     parent_sha = parents[0] if parents else None
 
-    runtime_changed: list[str] = []
+    runtime_changed_versions: list[tuple[str, str]] = []  # (name, bump_severity)
+    runtime_added_removed: list[str] = []
     dev_changed: list[str] = []
 
     if repo_path and commit_sha:
@@ -90,25 +140,51 @@ def _score_dependency_signal(
                 diff = diff_dependency_manifest(repo_path, commit_sha, parent_sha, manifest_path)
             except Exception:
                 dep_names = [g.nodes[v].get("path", v) for v, _ in changed_deps]
-                runtime_changed.extend(dep_names)
+                runtime_added_removed.extend(dep_names)
                 continue
-            for dep in diff["added"] + diff["removed"] + diff["changed"]:
-                target = dev_changed if _is_dev_dependency(dep) else runtime_changed
-                target.append(dep["name"])
+
+            for dep in diff["changed"]:
+                if _is_dev_dependency(dep):
+                    dev_changed.append(dep["name"])
+                else:
+                    bump = classify_version_bump(dep.get("old_version", ""), dep.get("version", ""))
+                    runtime_changed_versions.append((dep["name"], bump))
+
+            for dep in diff["added"] + diff["removed"]:
+                if _is_dev_dependency(dep):
+                    dev_changed.append(dep["name"])
+                else:
+                    runtime_added_removed.append(dep["name"])
     else:
         dep_names = [g.nodes[v].get("path", v) for v, _ in changed_deps]
-        runtime_changed = dep_names
+        runtime_added_removed = dep_names
 
-    runtime_changed = list(dict.fromkeys(runtime_changed))
     dev_changed = list(dict.fromkeys(dev_changed))
+    runtime_added_removed = list(dict.fromkeys(runtime_added_removed))
 
-    if runtime_changed:
-        score += 0.35
+    if runtime_changed_versions:
+        # Worst-case bump drives the score — one major bump among several
+        # patch bumps is still the thing worth investigating first.
+        worst_name, worst_bump = max(
+            runtime_changed_versions, key=lambda item: BUMP_SEVERITY_WEIGHT.get(item[1], 0.0)
+        )
+        score += BUMP_SEVERITY_WEIGHT.get(worst_bump, 0.25)
+        names = ", ".join(n for n, _ in runtime_changed_versions)
+        severity_note = f" (worst: {worst_name} — {worst_bump} version bump)" if worst_bump != "unknown" else ""
         evidence.append(EvidenceItem(
-            "FACT", f"Runtime dependency changed: {', '.join(runtime_changed)}"
+            "FACT", f"Runtime dependency version changed: {names}{severity_note}"
         ))
-        reasons.append("a dependency manifest change")
-    elif dev_changed:
+        reasons.append("a dependency version change")
+
+    if runtime_added_removed:
+        score += 0.20
+        evidence.append(EvidenceItem(
+            "FACT", f"Runtime dependency added/removed: {', '.join(runtime_added_removed)}"
+        ))
+        if not reasons:
+            reasons.append("a dependency manifest change")
+
+    if dev_changed and not runtime_changed_versions and not runtime_added_removed:
         score += 0.05
         evidence.append(EvidenceItem(
             "FACT", f"Dev-only dependency changed: {', '.join(dev_changed)}"
@@ -118,7 +194,7 @@ def _score_dependency_signal(
 
 
 def _score_commit(
-    g: nx.MultiDiGraph, commit_node: str
+    g: nx.MultiDiGraph, commit_node: str, repo_stats: dict
 ) -> tuple[float, list[EvidenceItem], str]:
     """
     Score a single commit as a regression suspect using transparent,
@@ -144,12 +220,19 @@ def _score_commit(
     reasons.extend(dep_reasons)
 
     # Signal 2: large diff, dampened for scaffolding-style commits.
-    total_insertions = sum(d.get("insertions", 0) for _, d in changed_files)
-    total_deletions = sum(d.get("deletions", 0) for _, d in changed_files)
+    #
+    # Fix: pure renames (change_type == "R") are excluded from churn —
+    # a file move/rename can carry large insertion/deletion counts from
+    # git's similarity detection without any real behavioral change, and
+    # previously wasn't counted as "new" either, so it got neither the
+    # rename discount nor the scaffolding discount.
+    non_rename_files = [(v, d) for v, d in changed_files if d.get("change_type") != "R"]
+    total_insertions = sum(d.get("insertions", 0) for _, d in non_rename_files)
+    total_deletions = sum(d.get("deletions", 0) for _, d in non_rename_files)
     total_churn = total_insertions + total_deletions
-    new_file_count = sum(1 for _, d in changed_files if d.get("change_type") == "A")
-    is_scaffolding = bool(changed_files) and (
-        new_file_count / len(changed_files) > 0.8
+    new_file_count = sum(1 for _, d in non_rename_files if d.get("change_type") == "A")
+    is_scaffolding = bool(non_rename_files) and (
+        new_file_count / len(non_rename_files) > 0.8
         and total_deletions < 0.1 * (total_insertions + 1)
     )
 
@@ -159,20 +242,14 @@ def _score_commit(
         note = " (mostly new files — looks like scaffolding, not a modification)" if is_scaffolding else ""
         evidence.append(EvidenceItem(
             "FACT",
-            f"Large diff: {total_churn} lines changed across {len(changed_files)} files{note}",
+            f"Large diff: {total_churn} lines changed across {len(non_rename_files)} files{note}",
         ))
         reasons.append("an unusually large change")
     elif total_churn > 50:
         score += 0.03 if is_scaffolding else 0.07
 
-    # Signal 3: commit message contains risk-signaling keywords.
-    #
-    # Fix: "fix" alone is too noisy — it fires on purely doc/template
-    # commits (e.g. "Fix .github/ISSUE_TEMPLATE from bare file to proper
-    # directory") that have nothing to do with a code regression. Only
-    # count "fix" as a risk signal if the commit also touches a file that
-    # isn't just docs/text — every other keyword here (revert, hack,
-    # workaround, hotfix, upgrade, bump) is specific enough to keep as-is.
+    # Signal 3: commit message contains risk-signaling keywords, with "fix"
+    # gated to commits that touch non-doc files.
     message = g.nodes[commit_node].get("message", "").lower()
     always_risky_keywords = ["upgrade", "bump", "update dep", "revert", "hack", "workaround", "hotfix"]
     hit_keywords = [k for k in always_risky_keywords if k in message]
@@ -205,10 +282,67 @@ def _score_commit(
         ))
         reasons.append("changes to test-covered functions")
 
+    # Signal 5: file hotspot — a touched file with a long history of
+    # changes across the reviewed commits is more likely to be a source
+    # of instability than a file touched once ever. Small weight; this is
+    # a correlational signal, not a causal one.
+    file_churn = repo_stats["file_churn"]
+    hotspot_files = [
+        g.nodes[v].get("path", v) for v, _ in changed_files
+        if file_churn.get(g.nodes[v].get("path", v), 0) >= HOTSPOT_THRESHOLD
+    ]
+    if hotspot_files:
+        score += 0.08
+        sample = ", ".join(hotspot_files[:3])
+        evidence.append(EvidenceItem(
+            "FACT",
+            f"Touches file(s) with a long change history in this repo: {sample} "
+            f"({HOTSPOT_THRESHOLD}+ prior changes)",
+        ))
+        reasons.append("changes to a historically volatile file")
+
+    # Signal 6: author is new to this repo (few or no other commits in the
+    # reviewed history) and is touching non-doc files. Small, additive-only
+    # weight — not meant to penalize new contributors, just to reflect that
+    # unfamiliarity with a codebase is a mild statistical risk factor.
+    author = g.nodes[commit_node].get("author", "unknown")
+    author_commit_count = repo_stats["author_counts"].get(author, 1)
+    touches_non_doc = any(
+        not any(g.nodes[v].get("path", v).endswith(ext) for ext in NON_RISK_EXTENSIONS)
+        for v, _ in changed_files
+    )
+    if author_commit_count <= NEW_CONTRIBUTOR_COMMIT_THRESHOLD and touches_non_doc and not is_scaffolding:
+        score += 0.05
+        evidence.append(EvidenceItem(
+            "FACT",
+            f"Author has {author_commit_count} commit(s) in the reviewed history",
+        ))
+        reasons.append("limited commit history from this author in this repo")
+
+    # Signal 7: merge-commit dampening. A merge commit's diff typically
+    # represents the union of already-reviewed branch commits (each of
+    # which is scored independently elsewhere in this same pass) — scoring
+    # the merge itself at full weight double-counts that risk and adds
+    # noise. Dampen rather than exclude entirely, since a merge commit can
+    # still occasionally introduce its own conflict-resolution bugs.
+    parents = g.nodes[commit_node].get("parents") or []
+    is_merge = len(parents) > 1
+    if is_merge and score > 0:
+        pre_dampen_score = score
+        score *= 0.3
+        evidence.append(EvidenceItem(
+            "FACT",
+            f"This is a merge commit ({len(parents)} parents) — signals below likely reflect "
+            f"already-reviewed branch commits rather than new risk introduced here "
+            f"(raw signal score {round(pre_dampen_score * 100)}% dampened to {round(score * 100)}%)",
+        ))
+
     score = min(score, 0.97)  # never claim near-certainty from heuristics alone
 
     if reasons:
         summary = "Likely cause: " + " combined with ".join(reasons) + "."
+        if is_merge:
+            summary += " (dampened — merge commit)"
     else:
         summary = "No strong regression signals detected for this commit."
 
@@ -225,23 +359,13 @@ def rank_suspects(
     """
     Score every commit in the graph and return the top-N ranked by
     confidence, each carrying its own transparent evidence chain.
-
-    `has_test_framework`: True only when a real, named test framework was
-    detected (pytest, jest, etc.) — not just a bare `tests/` directory.
-    When False, confidence is capped since there's no real ground truth to
-    validate the static heuristics against.
-
-    `has_weak_test_signal`: True when detect_test_framework() found only a
-    generic test directory ("unknown (test directory present)") with no
-    actual framework markers. This is weaker evidence than a real
-    framework but still more than nothing, so it gets a looser cap (55%)
-    than the no-signal-at-all case (40%).
     """
     commit_nodes = [n for n, d in g.nodes(data=True) if d.get("kind") == "commit"]
+    repo_stats = _compute_repo_stats(g)
     scored: list[Suspect] = []
 
     for cn in commit_nodes:
-        score, evidence, summary = _score_commit(g, cn)
+        score, evidence, summary = _score_commit(g, cn, repo_stats)
 
         if not has_test_framework:
             cap = 0.55 if has_weak_test_signal else 0.40

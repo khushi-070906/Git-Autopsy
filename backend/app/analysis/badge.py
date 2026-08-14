@@ -28,15 +28,13 @@ Design constraints (important — read before changing this file):
     bad owner/repo string) must degrade to a valid "unknown" badge, never
     a 500 — a broken image in someone's README is bad marketing.
 
-Requires an indexed `repo_url` column on the Analysis model to look up
-"most recent completed analysis for this repo" directly, rather than
-scanning the JSON result blob. Add one (indexed) if it doesn't already
-exist:
+Relies on Analysis.repo_url (already a plain, non-indexed String column
+as of the current schema) and Analysis.updated_at to find "most recent
+completed analysis for this repo" — NOT Analysis.id, since id is a UUID
+string and string-sorting UUIDs is not chronological order. If repo_url
+lookups get slow at scale, add an index:
 
     repo_url = Column(String, index=True, nullable=False)
-
-and make sure `run_analysis` sets it when the row is created, not just
-inside the JSON result.
 """
 from __future__ import annotations
 
@@ -97,7 +95,7 @@ def _latest_completed_analysis(repo_url: str) -> Analysis | None:
         return (
             db.query(Analysis)
             .filter(Analysis.repo_url == repo_url, Analysis.status == "completed")
-            .order_by(desc(Analysis.id))
+            .order_by(desc(Analysis.updated_at))
             .first()
         )
     finally:
@@ -121,7 +119,7 @@ def health_badge(owner: str, repo: str) -> Response:
     if analysis is None:
         return _badge_response(_shield_payload("AUTOPSY", "not analyzed", "lightgrey"))
 
-    result = analysis.result or {}
+    result = analysis.result() or {}
     health = result.get("health") or {}
     score = health.get("repository_health_score")
     risk_level = health.get("risk_level")

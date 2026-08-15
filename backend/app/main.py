@@ -16,6 +16,7 @@ from app.database import Analysis, SessionLocal, get_session, init_db
 from app.pipeline import run_analysis
 from app.security import InvalidRepositoryURL, validate_github_url
 from app.analysis import badge
+from app.analysis.evidence_graph import evidence_for_node_json
 
 
 @asynccontextmanager
@@ -111,6 +112,30 @@ def get_commits(analysis_id: str, db: Session = Depends(get_session)):
 @app.get("/api/analysis/{analysis_id}/graph")
 def get_graph(analysis_id: str, db: Session = Depends(get_session)):
     return _completed_result(analysis_id, db)["graph"]
+
+
+@app.get("/api/analysis/{analysis_id}/graph/node/{node_id:path}")
+def get_graph_node(analysis_id: str, node_id: str, db: Session = Depends(get_session)):
+    """
+    NEW. Powers the "click a node to see its evidence" interaction on the
+    causal graph: returns one node's data plus its immediate incoming and
+    outgoing edges.
+
+    node_id uses the `:path` converter (not the default `str` converter)
+    because node ids contain literal colons and slashes — e.g.
+    "function:app/analysis/detect.py::detect_language" — which the default
+    converter would otherwise treat as path-segment boundaries and 404 on.
+
+    Operates on the persisted graph JSON via evidence_for_node_json rather
+    than reconstructing an nx.MultiDiGraph, since only the serialized form
+    survives between the background job that built the graph and this
+    later request.
+    """
+    result = _completed_result(analysis_id, db)
+    evidence = evidence_for_node_json(result["graph"], node_id)
+    if "error" in evidence:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found in this analysis's graph.")
+    return evidence
 
 
 @app.get("/api/analysis/{analysis_id}/regressions")

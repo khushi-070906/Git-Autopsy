@@ -327,7 +327,7 @@ function Dashboard({ result, onReset }: { result: AnalysisResult; onReset: () =>
       </Section>
 
       <Section title="SYSTEM ANATOMY">
-        <EvidenceGraphView nodes={graph.nodes} edges={graph.edges} />
+        <EvidenceGraphView analysisId={result.id} nodes={graph.nodes} edges={graph.edges} />
       </Section>
     </div>
   );

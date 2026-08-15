@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -17,6 +18,8 @@ from app.pipeline import run_analysis
 from app.security import InvalidRepositoryURL, validate_github_url
 from app.analysis import badge
 from app.analysis.evidence_graph import evidence_for_node_json
+from app.analysis import counterfactual
+from app.analysis.cloner import clone_repository, cleanup_workdir
 
 
 @asynccontextmanager
@@ -136,6 +139,114 @@ def get_graph_node(analysis_id: str, node_id: str, db: Session = Depends(get_ses
     if "error" in evidence:
         raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found in this analysis's graph.")
     return evidence
+
+
+# --- Counterfactual replay -------------------------------------------------
+#
+# NOTE ON THIS IMPLEMENTATION: this reuses the same BackgroundTasks +
+# DB-row-polling pattern as /api/analyze for consistency with the existing
+# code, and an in-memory dict for job bookkeeping to avoid a DB migration
+# for a first cut. Two things to fix before this carries real traffic:
+#   1. In-memory _counterfactual_jobs is lost on process restart and isn't
+#      shared across multiple worker processes — move to a DB table
+#      (mirroring the Analysis model) once this is more than a prototype.
+#   2. Counterfactual runs execute the target repo's own test suite —
+#      genuine arbitrary code execution, unlike the rest of the pipeline.
+#      Run this in a locked-down worker (no network egress, capped
+#      CPU/memory, ephemeral filesystem), not the same process handling
+#      /api/analyze, before exposing this endpoint publicly.
+_counterfactual_jobs: dict[str, dict] = {}
+
+# Only frameworks counterfactual.py actually knows how to run. Anything
+# else in test_frameworks (e.g. "unknown-*") is filtered out here so the
+# endpoint can return a clear 400 instead of counterfactual.py raising
+# UnsupportedTestFramework mid-background-task where the caller can't see it.
+_SUPPORTED_FRAMEWORKS = {"pytest", "jest"}
+
+
+class CounterfactualRequest(BaseModel):
+    commit_sha: str
+
+
+def _run_counterfactual_job(job_id: str, analysis_id: str, repo_url: str, commit_sha: str, framework: str) -> None:
+    _counterfactual_jobs[job_id]["status"] = "running"
+    repo_dir = None
+    try:
+        repo_dir = clone_repository(repo_url)
+        result = counterfactual.run_counterfactual(repo_dir, commit_sha, framework)
+        _counterfactual_jobs[job_id] = {
+            "status": "completed",
+            "error": result.error,
+            "result": {
+                "commit_sha": result.commit_sha,
+                "short_sha": result.short_sha,
+                "framework": result.framework,
+                "removes_failure": result.removes_failure,
+                "baseline_failing_tests": result.baseline.failing_tests,
+                "without_commit_failing_tests": result.without_commit.failing_tests,
+                "baseline_timed_out": result.baseline.timed_out,
+                "without_commit_timed_out": result.without_commit.timed_out,
+            },
+        }
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("autopsy.main").exception(
+            "Counterfactual job %s failed for analysis %s, commit %s", job_id, analysis_id, commit_sha
+        )
+        _counterfactual_jobs[job_id] = {"status": "failed", "error": str(exc)[:2000], "result": None}
+    finally:
+        if repo_dir is not None:
+            cleanup_workdir(repo_dir)
+
+
+@app.post("/api/analysis/{analysis_id}/counterfactual")
+@limiter.limit(ANALYZE_RATE_LIMIT)
+def start_counterfactual(
+    request: Request,
+    analysis_id: str,
+    req: CounterfactualRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_session),
+):
+    """
+    Triggers an on-demand counterfactual replay for one suspect commit —
+    "what if this commit had not been introduced?" — reusing the repo_url
+    and test_frameworks already recorded for this analysis. Deliberately
+    on-demand rather than run automatically for every suspect: each run
+    clones the repo again and executes its test suite, which is expensive
+    and carries real code-execution risk (see module note above) — only
+    worth paying for the specific commit a user is actually investigating.
+    """
+    result = _completed_result(analysis_id, db)
+    row = _get_or_404(db, analysis_id)
+
+    valid_shas = {c["sha"] for c in result["commits"]}
+    if req.commit_sha not in valid_shas:
+        raise HTTPException(status_code=400, detail="commit_sha not found in this analysis.")
+
+    framework = next((f for f in result["test_frameworks"] if f in _SUPPORTED_FRAMEWORKS), None)
+    if framework is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No counterfactual-supported test framework detected for this repo "
+                f"(detected: {result['test_frameworks']}, supported: {sorted(_SUPPORTED_FRAMEWORKS)})."
+            ),
+        )
+
+    job_id = uuid.uuid4().hex
+    _counterfactual_jobs[job_id] = {"status": "queued", "error": None, "result": None}
+    background_tasks.add_task(
+        _run_counterfactual_job, job_id, analysis_id, row.repo_url, req.commit_sha, framework
+    )
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/api/counterfactual/{job_id}")
+def get_counterfactual_job(job_id: str):
+    job = _counterfactual_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Counterfactual job not found.")
+    return job
 
 
 @app.get("/api/analysis/{analysis_id}/regressions")

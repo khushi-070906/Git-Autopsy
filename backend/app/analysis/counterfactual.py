@@ -24,6 +24,8 @@ a structured result.
 from __future__ import annotations
 
 import logging
+import os
+import resource
 import shutil
 import subprocess
 import uuid
@@ -39,6 +41,56 @@ logger = logging.getLogger("autopsy.counterfactual")
 # timeout_seconds param for a specific call if a repo genuinely needs more,
 # but the default must stay conservative.
 DEFAULT_TIMEOUT_SECONDS = 120
+
+# --- Process-level hardening ------------------------------------------
+#
+# This module runs arbitrary, untrusted test code. The current deployment
+# (single container, no container-in-container capability) can't give
+# each run its own sandboxed OS/VM boundary — that requires infrastructure
+# this module can't provide from inside itself (a separate execution
+# service, or a microVM provider like E2B/Modal/Daytona). Until that
+# exists, these limits are the honest, achievable ceiling: they cap what
+# a single runaway or malicious test suite can consume or reach *within
+# the same container*, they do not isolate it from the container itself.
+
+# CPU-seconds and address-space (bytes) ceiling applied to the test
+# subprocess via resource.setrlimit, on top of the wall-clock timeout
+# already enforced by subprocess.run's `timeout`. A CPU-heavy but
+# non-hanging process (e.g. a tight infinite loop that still yields I/O)
+# can burn CPU without necessarily tripping a wall-clock timeout in every
+# case — RLIMIT_CPU is the backstop for that.
+_TEST_SUBPROCESS_CPU_SECONDS = 90
+_TEST_SUBPROCESS_MEMORY_BYTES = 1_500_000_000  # ~1.5 GB
+
+# Environment variables passed to a replay subprocess. Deliberately an
+# allowlist, not the inherited os.environ — a cloned repo's test suite
+# must never be able to read this service's own secrets (DB URL, API
+# keys, etc.) just because they happened to be in the parent process's
+# environment. PATH is required for the test runner binary to resolve at
+# all; HOME avoids tools that assume it's set (pip caches, etc.) failing
+# oddly.
+_SUBPROCESS_ENV_ALLOWLIST = {"PATH", "HOME", "LANG", "LC_ALL"}
+
+
+def _sandboxed_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k in _SUBPROCESS_ENV_ALLOWLIST}
+
+
+def _limit_test_subprocess_resources() -> None:
+    """
+    Passed as `preexec_fn` to subprocess.run for test-suite invocations
+    only (not git operations, which are trusted). Runs in the forked
+    child before exec — sets hard resource ceilings that apply to that
+    process (and, notably, do NOT get inherited more permissively by
+    anything it execs).
+    """
+    resource.setrlimit(
+        resource.RLIMIT_CPU, (_TEST_SUBPROCESS_CPU_SECONDS, _TEST_SUBPROCESS_CPU_SECONDS)
+    )
+    resource.setrlimit(
+        resource.RLIMIT_AS, (_TEST_SUBPROCESS_MEMORY_BYTES, _TEST_SUBPROCESS_MEMORY_BYTES)
+    )
+
 
 # Maps a detected test framework (as returned by detect.detect_test_framework)
 # to the command used to run it and a parser for pulling failing test IDs
@@ -171,6 +223,7 @@ def _failure_removed(baseline: TestRunResult, without_commit: TestRunResult) -> 
 
 
 def _run(cmd: list[str], cwd: Path, timeout_seconds: int) -> subprocess.CompletedProcess:
+    """Used for git operations only — trusted commands, full inherited env."""
     return subprocess.run(
         cmd,
         cwd=str(cwd),
@@ -178,6 +231,27 @@ def _run(cmd: list[str], cwd: Path, timeout_seconds: int) -> subprocess.Complete
         text=True,
         timeout=timeout_seconds,
         check=False,
+    )
+
+
+def _run_untrusted(cmd: list[str], cwd: Path, timeout_seconds: int) -> subprocess.CompletedProcess:
+    """
+    Used for the actual test-suite invocation only — the one command in
+    this module that runs code from the target repo itself (test files
+    can, and often do, execute arbitrary imports/fixtures). Restricted
+    env (see _SUBPROCESS_ENV_ALLOWLIST) and CPU/memory ceilings (see
+    _limit_test_subprocess_resources) on top of the same wall-clock
+    timeout _run already gets from subprocess.run.
+    """
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+        env=_sandboxed_env(),
+        preexec_fn=_limit_test_subprocess_resources,
     )
 
 
@@ -240,7 +314,7 @@ def _revert_commit(worktree_path: Path, commit_sha: str, timeout_seconds: int) -
 def _run_tests(worktree_path: Path, framework: str, timeout_seconds: int) -> TestRunResult:
     cmd = _FRAMEWORK_COMMANDS[framework]
     try:
-        result = _run(cmd, cwd=worktree_path, timeout_seconds=timeout_seconds)
+        result = _run_untrusted(cmd, cwd=worktree_path, timeout_seconds=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
         partial = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
         return TestRunResult(passed=False, timed_out=True, raw_output=partial[:4000])

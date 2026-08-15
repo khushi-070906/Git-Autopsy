@@ -1,5 +1,11 @@
-import { useMemo, useState } from "react";
-import { GraphEdge, GraphNode } from "./api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  GraphEdge,
+  GraphNode,
+  CounterfactualJob,
+  startCounterfactual,
+  getCounterfactualJob,
+} from "./api";
 
 const KIND_COLOR: Record<string, string> = {
   commit: "var(--tag-fact)",
@@ -15,7 +21,6 @@ const KIND_COLOR: Record<string, string> = {
 // containing a function). These render distinctly in the evidence list —
 // bold + colored instead of the default muted row — so a causal link
 // doesn't read the same as "this file happens to contain this function".
-// Extend as counterfactual-confirmed edges get their own edge kind.
 const CAUSAL_EDGE_KINDS = new Set(["COMMIT_CHANGED_DEPENDENCY"]);
 
 // suspect_confidence (0-1) -> ring color. Written onto commit nodes by
@@ -48,7 +53,154 @@ function label(n: GraphNode): string {
   }
 }
 
-export function EvidenceGraphView({ nodes, edges }: { nodes: GraphNode[]; edges: GraphEdge[] }) {
+const POLL_INTERVAL_MS = 2500;
+
+function CounterfactualPanel({ analysisId, commitSha }: { analysisId: string; commitSha: string }) {
+  const [job, setJob] = useState<CounterfactualJob | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+  const pollRef = useRef<number | null>(null);
+
+  // Reset state whenever the selected commit changes, and stop any
+  // in-flight poll from the previously selected commit — otherwise a
+  // stale timer can overwrite this commit's panel with the old commit's
+  // result a few seconds after switching selection.
+  useEffect(() => {
+    setJob(null);
+    setStartError(null);
+    if (pollRef.current) {
+      window.clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+    return () => {
+      if (pollRef.current) window.clearInterval(pollRef.current);
+    };
+  }, [commitSha]);
+
+  const runReplay = async () => {
+    setStarting(true);
+    setStartError(null);
+    try {
+      const { job_id } = await startCounterfactual(analysisId, commitSha);
+      setJob({ status: "queued", error: null, result: null });
+      pollRef.current = window.setInterval(async () => {
+        try {
+          const j = await getCounterfactualJob(job_id);
+          setJob(j);
+          if (j.status === "completed" || j.status === "failed") {
+            if (pollRef.current) {
+              window.clearInterval(pollRef.current);
+              pollRef.current = null;
+            }
+          }
+        } catch (err) {
+          setStartError(err instanceof Error ? err.message : "Failed to poll job status.");
+          if (pollRef.current) {
+            window.clearInterval(pollRef.current);
+            pollRef.current = null;
+          }
+        }
+      }, POLL_INTERVAL_MS);
+    } catch (err) {
+      setStartError(err instanceof Error ? err.message : "Failed to start replay.");
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 10, marginBottom: 12, borderTop: "1px solid var(--hairline)", paddingTop: 10 }}>
+      <div className="mono-label" style={{ marginBottom: 6 }}>Counterfactual replay</div>
+
+      {!job && (
+        <>
+          <div style={{ fontSize: 12, color: "var(--paper-dim)", marginBottom: 8 }}>
+            Re-runs the test suite with this commit reverted, to check whether removing it
+            actually eliminates a failing test — a verified result, not a heuristic.
+          </div>
+          <button
+            onClick={runReplay}
+            disabled={starting}
+            style={{
+              fontSize: 12,
+              fontFamily: "var(--font-mono)",
+              padding: "6px 10px",
+              borderRadius: 3,
+              border: "1px solid var(--hairline)",
+              background: "var(--panel-raised)",
+              color: "var(--paper)",
+              cursor: starting ? "default" : "pointer",
+              opacity: starting ? 0.6 : 1,
+            }}
+          >
+            {starting ? "Starting..." : "Verify with test replay"}
+          </button>
+          {startError && (
+            <div style={{ fontSize: 12, color: "#c24a3f", marginTop: 6 }}>{startError}</div>
+          )}
+        </>
+      )}
+
+      {job && (job.status === "queued" || job.status === "running") && (
+        <div style={{ fontSize: 12, color: "var(--paper-dim)" }}>
+          {job.status === "queued" ? "Queued..." : "Running test suite with and without this commit..."}
+        </div>
+      )}
+
+      {job && job.status === "failed" && (
+        <div style={{ fontSize: 12, color: "#c24a3f" }}>
+          Replay failed: {job.error || "unknown error"}
+        </div>
+      )}
+
+      {job && job.status === "completed" && job.result && (
+        <div
+          style={{
+            fontSize: 12,
+            padding: 8,
+            borderRadius: 3,
+            border: `1px solid ${job.result.removes_failure ? "#c24a3f" : "var(--hairline)"}`,
+            background: job.result.removes_failure ? "rgba(194,74,63,0.08)" : "var(--panel-raised)",
+          }}
+        >
+          <div style={{ fontWeight: 600, marginBottom: 4, color: job.result.removes_failure ? "#c24a3f" : "var(--paper)" }}>
+            {job.result.removes_failure
+              ? "Confirmed — reverting this commit eliminates the failure"
+              : "Not confirmed — reverting this commit did not eliminate the failure"}
+          </div>
+          <div style={{ color: "var(--paper-dim)" }}>
+            Framework: {job.result.framework}
+          </div>
+          {job.result.baseline_failing_tests.length > 0 && (
+            <div style={{ color: "var(--paper-dim)", marginTop: 4 }}>
+              Failing with commit: {job.result.baseline_failing_tests.join(", ")}
+            </div>
+          )}
+          {job.result.without_commit_failing_tests.length > 0 && (
+            <div style={{ color: "var(--paper-dim)", marginTop: 2 }}>
+              Still failing without commit: {job.result.without_commit_failing_tests.join(", ")}
+            </div>
+          )}
+          {(job.result.baseline_timed_out || job.result.without_commit_timed_out) && (
+            <div style={{ color: "#c24a3f", marginTop: 4 }}>
+              One or both test runs timed out — result may be inconclusive.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function EvidenceGraphView({
+  analysisId,
+  nodes,
+  edges,
+}: {
+  analysisId: string;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}) {
   const [selected, setSelected] = useState<string | null>(null);
 
   // Suspect commits first within their kind group, ranked by confidence —
@@ -92,6 +244,13 @@ export function EvidenceGraphView({ nodes, edges }: { nodes: GraphNode[]; edges:
   const selectedSummary =
     selectedNode && typeof selectedNode.suspect_summary === "string"
       ? (selectedNode.suspect_summary as string)
+      : null;
+  // Counterfactual replay only makes sense for a commit node — sha is
+  // stored as `sha` on commit nodes (see evidence_graph.py's
+  // g.add_node(f"commit:{c.sha}", kind="commit", sha=c.sha, ...)).
+  const selectedCommitSha =
+    selectedNode && selectedNode.kind === "commit" && typeof selectedNode.sha === "string"
+      ? (selectedNode.sha as string)
       : null;
 
   return (
@@ -150,7 +309,7 @@ export function EvidenceGraphView({ nodes, edges }: { nodes: GraphNode[]; edges:
           padding: 16,
           position: "sticky",
           top: 16,
-          maxHeight: 480,
+          maxHeight: 560,
           overflowY: "auto",
         }}
       >
@@ -194,6 +353,10 @@ export function EvidenceGraphView({ nodes, edges }: { nodes: GraphNode[]; edges:
               >
                 {selectedSummary}
               </div>
+            )}
+
+            {selectedCommitSha && (
+              <CounterfactualPanel analysisId={analysisId} commitSha={selectedCommitSha} />
             )}
 
             <div className="mono-label" style={{ marginTop: 12, marginBottom: 6 }}>Incoming ({incoming.length})</div>

@@ -158,6 +158,7 @@ def run_analysis(analysis_id: str, repo_url: str) -> None:
             }
 
         result = {
+            "id": analysis_id,
             "repo_url": repo_url,
             "language": language_info,
             "dependency_files": dep_files,

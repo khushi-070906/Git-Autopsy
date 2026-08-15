@@ -54,6 +54,64 @@ def _counterfactual_to_dict(result) -> dict:
     }
 
 
+def apply_counterfactual_result(existing_regressions: dict, counterfactual_result) -> dict:
+    """
+    NEW. Layers a completed on-demand counterfactual run onto an
+    *already-computed* regressions dict (the one sitting in a stored
+    Analysis row's result()), without re-running rank_suspects() or
+    needing the live evidence graph — the caller (main.py's
+    _run_counterfactual_job) only has the persisted analysis result on
+    hand, not the nx.MultiDiGraph that built it.
+
+    This is what makes a completed replay actually show up in the
+    dashboard's SECONDARY FINDINGS section instead of staying stuck at
+    "insufficient_data" forever after a successful verification — without
+    this, the counterfactual result only ever lived in the separate
+    per-job dict the graph panel polls, and the main analysis record
+    never learned about it.
+
+    `existing_regressions` should be `analysis_result["regressions"]` as
+    already stored (i.e. whatever detect_regressions() previously
+    returned — most commonly the "insufficient_data" heuristic-only
+    shape, since that's the default before any confirmation exists).
+    Does not overwrite a CI-confirmed regression if one is already
+    present — CI confirmation reflects the repo's own real-world test
+    run and takes precedence over AUTOPSY's own reconstructed replay.
+    """
+    if existing_regressions.get("status") == "confirmed" and "confirmed_regression" in existing_regressions:
+        if existing_regressions["confirmed_regression"].get("source") != "counterfactual_replay":
+            # Already CI-confirmed — leave it alone.
+            return existing_regressions
+
+    if counterfactual_result.error is not None:
+        # Replay itself failed (timeout, conflict, missing test runner) —
+        # don't touch the existing regressions dict; nothing new was learned.
+        return existing_regressions
+
+    if counterfactual_result.removes_failure:
+        updated = dict(existing_regressions)
+        updated["status"] = "confirmed"
+        updated["message"] = (
+            f"Confirmed via counterfactual replay: re-running the test suite with "
+            f"commit {counterfactual_result.short_sha} reverted eliminates a failing "
+            f"test that is present with the commit applied."
+        )
+        updated["confirmed_regression"] = _counterfactual_to_dict(counterfactual_result)
+        updated["note"] = (
+            "The confirmed_regression field above is sourced from an isolated replay "
+            "AUTOPSY ran itself (test suite executed with and without the commit) — "
+            "a genuine result, not a static-heuristic guess."
+        )
+        return updated
+
+    # Ran successfully but didn't confirm this commit — still worth
+    # surfacing as a ruled-out candidate rather than silently discarding
+    # a real result.
+    updated = dict(existing_regressions)
+    updated["ruled_out"] = _counterfactual_to_dict(counterfactual_result)
+    return updated
+
+
 def detect_regressions(
     g: nx.MultiDiGraph,
     has_test_execution_data: bool = False,

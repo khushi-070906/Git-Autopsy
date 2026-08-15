@@ -201,6 +201,16 @@ def _run_counterfactual_job(job_id: str, analysis_id: str, repo_url: str, commit
                 "without_commit_failing_tests": result.without_commit.failing_tests,
                 "baseline_timed_out": result.baseline.timed_out,
                 "without_commit_timed_out": result.without_commit.timed_out,
+                # Raw runner output (already truncated to 4000 chars by
+                # counterfactual.py's _run_tests) — lets a human check
+                # *why* failing_tests came back empty: the suite genuinely
+                # passed, vs. it failed in a way _parse_failing_tests
+                # doesn't recognize (e.g. a collection error rather than
+                # individual FAILED lines). Without this, an empty
+                # failing_tests list is ambiguous between those two very
+                # different situations.
+                "baseline_raw_output": result.baseline.raw_output,
+                "without_commit_raw_output": result.without_commit.raw_output,
             },
         )
 

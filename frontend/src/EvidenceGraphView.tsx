@@ -55,7 +55,15 @@ function label(n: GraphNode): string {
 
 const POLL_INTERVAL_MS = 2500;
 
-function CounterfactualPanel({ analysisId, commitSha }: { analysisId: string; commitSha: string }) {
+function CounterfactualPanel({
+  analysisId,
+  commitSha,
+  onComplete,
+}: {
+  analysisId: string;
+  commitSha: string;
+  onComplete?: () => void;
+}) {
   const [job, setJob] = useState<CounterfactualJob | null>(null);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
@@ -92,6 +100,15 @@ function CounterfactualPanel({ analysisId, commitSha }: { analysisId: string; co
               window.clearInterval(pollRef.current);
               pollRef.current = null;
             }
+            // Backend persists confirmed/ruled-out outcomes into the
+            // stored Analysis row (see main.py's _run_counterfactual_job
+            // -> regression_detection.apply_counterfactual_result). This
+            // tells the parent to re-fetch getAnalysis so SECONDARY
+            // FINDINGS picks it up immediately instead of only after a
+            // manual page reload. Fired for "failed" too so a stale
+            // in-flight indicator elsewhere doesn't linger, even though
+            // a failed replay writes nothing new server-side.
+            if (j.status === "completed") onComplete?.();
           }
         } catch (err) {
           setStartError(err instanceof Error ? err.message : "Failed to poll job status.");
@@ -196,10 +213,12 @@ export function EvidenceGraphView({
   analysisId,
   nodes,
   edges,
+  onCounterfactualComplete,
 }: {
   analysisId: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
+  onCounterfactualComplete?: () => void;
 }) {
   const [selected, setSelected] = useState<string | null>(null);
 
@@ -356,7 +375,11 @@ export function EvidenceGraphView({
             )}
 
             {selectedCommitSha && (
-              <CounterfactualPanel analysisId={analysisId} commitSha={selectedCommitSha} />
+              <CounterfactualPanel
+                analysisId={analysisId}
+                commitSha={selectedCommitSha}
+                onComplete={onCounterfactualComplete}
+              />
             )}
 
             <div className="mono-label" style={{ marginTop: 12, marginBottom: 6 }}>Incoming ({incoming.length})</div>

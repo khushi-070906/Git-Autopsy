@@ -55,6 +55,66 @@ function label(n: GraphNode): string {
 
 const POLL_INTERVAL_MS = 2500;
 
+function RawOutputToggle({ baseline, withoutCommit }: { baseline: string; withoutCommit: string }) {
+  const [open, setOpen] = useState(false);
+  if (!baseline && !withoutCommit) return null;
+  return (
+    <div style={{ marginTop: 8 }}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{
+          fontSize: 11,
+          fontFamily: "var(--font-mono)",
+          background: "none",
+          border: "none",
+          color: "var(--paper-dim)",
+          cursor: "pointer",
+          textDecoration: "underline",
+          padding: 0,
+        }}
+      >
+        {open ? "Hide" : "View"} raw test output
+      </button>
+      {open && (
+        <div style={{ marginTop: 6 }}>
+          <div style={{ fontSize: 11, color: "var(--paper-dim)", marginBottom: 2 }}>With commit:</div>
+          <pre
+            style={{
+              fontSize: 10,
+              background: "#0a0a0a",
+              color: "#c8c8c0",
+              padding: 8,
+              borderRadius: 3,
+              overflowX: "auto",
+              maxHeight: 180,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+            }}
+          >
+            {baseline || "(no output captured)"}
+          </pre>
+          <div style={{ fontSize: 11, color: "var(--paper-dim)", margin: "6px 0 2px" }}>Without commit:</div>
+          <pre
+            style={{
+              fontSize: 10,
+              background: "#0a0a0a",
+              color: "#c8c8c0",
+              padding: 8,
+              borderRadius: 3,
+              overflowX: "auto",
+              maxHeight: 180,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+            }}
+          >
+            {withoutCommit || "(no output captured)"}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CounterfactualPanel({
   analysisId,
   commitSha,
@@ -203,6 +263,10 @@ function CounterfactualPanel({
               One or both test runs timed out — result may be inconclusive.
             </div>
           )}
+          <RawOutputToggle
+            baseline={job.result.baseline_raw_output}
+            withoutCommit={job.result.without_commit_raw_output}
+          />
         </div>
       )}
     </div>

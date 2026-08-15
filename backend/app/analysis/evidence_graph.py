@@ -134,6 +134,29 @@ def build_evidence_graph(
     return g
 
 
+def annotate_suspect_confidence(g: nx.MultiDiGraph, suspects: list) -> None:
+    """
+    NEW. Writes each Suspect's confidence/summary back onto its matching
+    commit node, in place. Must be called after why_analysis.rank_suspects()
+    and before graph_to_json() — otherwise the serialized graph has no way
+    for the frontend to know which commits are suspects, forcing it to
+    cross-reference the separate `suspects` list by sha on every render.
+
+    Only commit nodes that made it into `suspects` (i.e. scored above
+    min_confidence) get annotated; everything else is left as-is so the
+    frontend can distinguish "not a suspect" from "suspect, low confidence".
+    """
+    by_sha = {s.commit_sha: s for s in suspects}
+    for node, data in g.nodes(data=True):
+        if data.get("kind") != "commit":
+            continue
+        s = by_sha.get(data.get("sha"))
+        if s is None:
+            continue
+        data["suspect_confidence"] = s.confidence
+        data["suspect_summary"] = s.likely_cause_summary
+
+
 def _looks_like_test_file(path: str) -> bool:
     p = path.lower()
     return "test" in p.split("/")[-1] or p.split("/")[0] in {"tests", "test"}
@@ -151,7 +174,10 @@ def graph_to_json(g: nx.MultiDiGraph) -> dict:
 
 def evidence_for_node(g: nx.MultiDiGraph, node_id: str) -> dict:
     """Return a node's data plus its immediate incoming/outgoing edges — used
-    by the 'click a node to see evidence' UI feature."""
+    by the 'click a node to see evidence' UI feature. Operates on a live
+    networkx graph — only usable where one is in memory (e.g. same request
+    that just built it). See evidence_for_node_json for the persisted-graph
+    equivalent used by the API."""
     if node_id not in g:
         return {"error": "node not found"}
     incoming = [
@@ -163,3 +189,34 @@ def evidence_for_node(g: nx.MultiDiGraph, node_id: str) -> dict:
         for _, v, data in g.out_edges(node_id, data=True)
     ]
     return {"node": dict(g.nodes[node_id]), "incoming": incoming, "outgoing": outgoing}
+
+
+def evidence_for_node_json(graph_json: dict, node_id: str) -> dict:
+    """
+    NEW. Same contract as evidence_for_node, but operates on the serialized
+    {nodes, edges} dict produced by graph_to_json() and stored in
+    Analysis.result() — this is what the API actually has on hand when
+    serving GET /api/analysis/{id}/graph/node/{node_id}, since only the JSON
+    form (not a live nx.MultiDiGraph) is persisted between the background
+    job and the request that later asks about one node.
+
+    Kept as a separate function rather than reconstructing an nx.MultiDiGraph
+    from JSON on every call — that round-trip is pure overhead for what's
+    just two list filters.
+    """
+    nodes_by_id = {n["id"]: n for n in graph_json.get("nodes", [])}
+    if node_id not in nodes_by_id:
+        return {"error": "node not found"}
+
+    incoming = [
+        {"from": e["source"], **{k: v for k, v in e.items() if k not in ("source", "target")}}
+        for e in graph_json.get("edges", [])
+        if e["target"] == node_id
+    ]
+    outgoing = [
+        {"to": e["target"], **{k: v for k, v in e.items() if k not in ("source", "target")}}
+        for e in graph_json.get("edges", [])
+        if e["source"] == node_id
+    ]
+    node = {k: v for k, v in nodes_by_id[node_id].items() if k != "id"}
+    return {"node": node, "incoming": incoming, "outgoing": outgoing}

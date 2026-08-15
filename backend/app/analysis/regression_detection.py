@@ -3,13 +3,25 @@ Phase 7 — Regression detection.
 
 Without executed test history, AUTOPSY previously could only ever report
 "insufficient_data" — static heuristics flagging PLAUSIBLE triggers, never
-a confirmed cause. This module now accepts an optional `confirmed_regression`
-(produced by ci_status.find_confirmed_regression from real GitHub Actions /
-Checks API data) — when one is found, the response reports a genuine
-last-passing -> first-failing transition instead of only a static guess.
-This only applies to repos that actually have CI configured and that
-AUTOPSY was able to reach GitHub's API for; everything else still falls
-back to the original heuristic-only behavior unchanged.
+a confirmed cause. This module accepts two independent, optional sources of
+real (non-heuristic) confirmation:
+
+  1. `confirmed_regression` — produced by ci_status.find_confirmed_regression
+     from real GitHub Actions / Checks API data (a genuine last-passing ->
+     first-failing transition observed in the repo's own CI history).
+  2. `counterfactual_result` — produced by counterfactual.run_counterfactual,
+     from an isolated replay: the test suite run with a suspect commit
+     reverted, showing that removing it eliminates a specific failing test.
+
+Either one, when present, upgrades the response from a static guess to a
+"confirmed" status. They are independent and can both be present (CI status
+is checked automatically for every analysis; counterfactual is triggered
+on-demand per commit from the graph UI) — CI confirmation is preferred when
+both exist, since it reflects the repo's own real-world test run rather
+than AUTOPSY's best-effort reconstruction of one.
+
+Repos with neither still fall back to the original heuristic-only behavior,
+unchanged.
 """
 from __future__ import annotations
 
@@ -25,23 +37,45 @@ def _suspect_to_dict(s: Suspect) -> dict:
     return d
 
 
+def _counterfactual_to_dict(result) -> dict:
+    """
+    Shapes a counterfactual.CounterfactualResult into the same
+    confirmed_regression dict shape ci_status.find_confirmed_regression
+    already produces, so the frontend's confirmed-regression rendering
+    doesn't need to branch on which source produced it.
+    """
+    return {
+        "short_sha": result.short_sha,
+        "commit_sha": result.commit_sha,
+        "source": "counterfactual_replay",
+        "framework": result.framework,
+        "failing_tests_with_commit": result.baseline.failing_tests,
+        "failing_tests_without_commit": result.without_commit.failing_tests,
+    }
+
+
 def detect_regressions(
     g: nx.MultiDiGraph,
     has_test_execution_data: bool = False,
     has_test_framework: bool = True,
     has_weak_test_signal: bool = False,
     confirmed_regression: dict | None = None,
+    counterfactual_result=None,
 ) -> dict:
     """
     `has_test_execution_data`: whether we ran tests ourselves in a sandbox
-    (still always False — AUTOPSY has no sandboxed execution engine).
+    for the commit currently being evaluated. True exactly when
+    `counterfactual_result` is provided and it successfully ran (no error,
+    no timeout on either side) — see pipeline.py / the counterfactual
+    endpoint for where this is set.
 
     `confirmed_regression`: optional dict from
-    ci_status.find_confirmed_regression, containing a real last-passing ->
-    first-failing transition sourced from GitHub's Checks API. When
-    present, this is genuine evidence — not a static guess — so it's
-    surfaced distinctly with status "confirmed" rather than folded into
-    the "PLAUSIBLE... not confirmed" heuristic list.
+    ci_status.find_confirmed_regression — see module docstring.
+
+    `counterfactual_result`: optional counterfactual.CounterfactualResult
+    from an on-demand replay for one specific suspect commit — see module
+    docstring. Only ever covers one commit per call (whichever the user
+    asked to verify), unlike confirmed_regression which is repo-wide.
     """
     heuristic_suspects = rank_suspects(
         g, top_n=10, min_confidence=0.3,
@@ -67,6 +101,47 @@ def detect_regressions(
             ),
         }
 
+    if counterfactual_result is not None and counterfactual_result.error is None:
+        if counterfactual_result.removes_failure:
+            return {
+                "status": "confirmed",
+                "message": (
+                    f"Confirmed via counterfactual replay: re-running the test suite with "
+                    f"commit {counterfactual_result.short_sha} reverted eliminates a failing "
+                    f"test that is present with the commit applied."
+                ),
+                "confirmed_regression": _counterfactual_to_dict(counterfactual_result),
+                "suspicious_changes": [_suspect_to_dict(s) for s in heuristic_suspects],
+                "note": (
+                    "The confirmed_regression field above is sourced from an isolated replay "
+                    "AUTOPSY ran itself (test suite executed with and without the commit) — "
+                    "a genuine result, not a static-heuristic guess. The suspicious_changes "
+                    "list below is still the same PLAUSIBLE-trigger heuristic ranking as "
+                    "always, included for context."
+                ),
+            }
+        else:
+            # A real result, just a negative one: replay ran successfully
+            # but reverting this commit did NOT remove the failure. That's
+            # worth surfacing distinctly from "we never checked" — it
+            # actively rules this commit out, which is useful even though
+            # it isn't a confirmed regression.
+            return {
+                "status": "insufficient_data",
+                "message": (
+                    f"Counterfactual replay ran successfully but reverting commit "
+                    f"{counterfactual_result.short_sha} did not eliminate the observed "
+                    f"failure — this commit is likely not the cause."
+                ),
+                "ruled_out": _counterfactual_to_dict(counterfactual_result),
+                "suspicious_changes": [_suspect_to_dict(s) for s in heuristic_suspects],
+                "note": (
+                    "The ruled_out field reflects a real replay result, not a heuristic. "
+                    "The suspicious_changes list below is the same PLAUSIBLE-trigger "
+                    "heuristic ranking as always."
+                ),
+            }
+
     if not has_test_execution_data:
         return {
             "status": "insufficient_data",
@@ -79,8 +154,16 @@ def detect_regressions(
                 "regression triggers — they are not confirmed regressions."
             ),
         }
-    # Reserved for Phase 7+ optional isolated test-execution feature.
-    raise NotImplementedError("Test-execution-based regression detection is not enabled in V1.")
+    # Reserved for future work: has_test_execution_data True but neither
+    # confirmed_regression nor counterfactual_result provided shouldn't
+    # normally happen given how pipeline.py/the counterfactual endpoint
+    # set it — kept as an explicit error rather than silently falling
+    # through, so a future caller mismatch is loud instead of quietly
+    # returning insufficient_data.
+    raise NotImplementedError(
+        "has_test_execution_data=True but no confirmed_regression or "
+        "counterfactual_result was provided."
+    )
 
 
 def compute_repository_health(g: nx.MultiDiGraph, suspects: list[Suspect]) -> dict:

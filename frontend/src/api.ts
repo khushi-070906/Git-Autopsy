@@ -97,6 +97,8 @@ export interface CounterfactualResultPayload {
   without_commit_failing_tests: string[];
   baseline_timed_out: boolean;
   without_commit_timed_out: boolean;
+  baseline_raw_output: string;
+  without_commit_raw_output: string;
 }
 
 export interface CounterfactualJob {

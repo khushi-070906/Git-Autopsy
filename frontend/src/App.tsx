@@ -67,6 +67,16 @@ export default function App() {
     }
   }
 
+  async function onRefresh() {
+    if (!analysisId) return;
+    try {
+      const data = await getAnalysis(analysisId);
+      if (data.result) setResult(data.result);
+    } catch {
+      // transient — leave current result showing rather than clearing it
+    }
+  }
+
   return (
     <div style={{ minHeight: "100%", padding: "0 0 80px" }}>
       <Header />
@@ -83,7 +93,11 @@ export default function App() {
 
       {result && (
         <ErrorBoundary>
-          <Dashboard result={result} onReset={() => { setResult(null); setAnalysisId(null); setRepoUrl(""); }} />
+          <Dashboard
+            result={result}
+            onReset={() => { setResult(null); setAnalysisId(null); setRepoUrl(""); }}
+            onRefresh={onRefresh}
+          />
         </ErrorBoundary>
       )}
     </div>
@@ -210,7 +224,7 @@ function Landing({
   );
 }
 
-function Dashboard({ result, onReset }: { result: AnalysisResult; onReset: () => void }) {
+function Dashboard({ result, onReset, onRefresh }: { result: AnalysisResult; onReset: () => void; onRefresh: () => void }) {
   const h = result.health ?? {
     repository_health_score: 0,
     risk_level: "LOW",
@@ -327,7 +341,7 @@ function Dashboard({ result, onReset }: { result: AnalysisResult; onReset: () =>
       </Section>
 
       <Section title="SYSTEM ANATOMY">
-        <EvidenceGraphView analysisId={result.id} nodes={graph.nodes} edges={graph.edges} />
+        <EvidenceGraphView analysisId={result.id} nodes={graph.nodes} edges={graph.edges} onCounterfactualComplete={onRefresh} />
       </Section>
     </div>
   );

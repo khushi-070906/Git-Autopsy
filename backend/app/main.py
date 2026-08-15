@@ -19,6 +19,7 @@ from app.security import InvalidRepositoryURL, validate_github_url
 from app.analysis import badge
 from app.analysis.evidence_graph import evidence_for_node_json
 from app.analysis import counterfactual
+from app.analysis import regression_detection
 from app.analysis.cloner import clone_repository, cleanup_workdir
 
 

@@ -13,7 +13,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
-from app.database import Analysis, SessionLocal, get_session, init_db
+from app.database import Analysis, CounterfactualJob, SessionLocal, get_session, init_db
 from app.pipeline import run_analysis
 from app.security import InvalidRepositoryURL, validate_github_url
 from app.analysis import badge
@@ -144,19 +144,15 @@ def get_graph_node(analysis_id: str, node_id: str, db: Session = Depends(get_ses
 
 # --- Counterfactual replay -------------------------------------------------
 #
-# NOTE ON THIS IMPLEMENTATION: this reuses the same BackgroundTasks +
-# DB-row-polling pattern as /api/analyze for consistency with the existing
-# code, and an in-memory dict for job bookkeeping to avoid a DB migration
-# for a first cut. Two things to fix before this carries real traffic:
-#   1. In-memory _counterfactual_jobs is lost on process restart and isn't
-#      shared across multiple worker processes — move to a DB table
-#      (mirroring the Analysis model) once this is more than a prototype.
-#   2. Counterfactual runs execute the target repo's own test suite —
-#      genuine arbitrary code execution, unlike the rest of the pipeline.
-#      Run this in a locked-down worker (no network egress, capped
-#      CPU/memory, ephemeral filesystem), not the same process handling
-#      /api/analyze, before exposing this endpoint publicly.
-_counterfactual_jobs: dict[str, dict] = {}
+# Job status/results are persisted in the CounterfactualJob table (see
+# app/database.py) rather than an in-memory dict — survives process
+# restarts and works correctly if this service ever runs more than one
+# instance. Execution itself still runs in-process via BackgroundTasks;
+# see counterfactual.py's module docstring and the Dockerfile's non-root
+# user for the process-level hardening currently in place. True
+# container/VM-level isolation (a separate execution service, or a
+# provider like E2B/Modal/Daytona) is a larger infrastructure change,
+# not something this table changes.
 
 # Only frameworks counterfactual.py actually knows how to run. Anything
 # else in test_frameworks (e.g. "unknown-*") is filtered out here so the
@@ -169,16 +165,34 @@ class CounterfactualRequest(BaseModel):
     commit_sha: str
 
 
+def _set_job_status(job_id: str, status: str, error: str | None = None, result: dict | None = None) -> None:
+    db = SessionLocal()
+    try:
+        row = db.get(CounterfactualJob, job_id)
+        if row is None:
+            return
+        row.status = status
+        if error is not None:
+            row.error = error
+        if result is not None:
+            row.set_result(result)
+        db.commit()
+    finally:
+        db.close()
+
+
 def _run_counterfactual_job(job_id: str, analysis_id: str, repo_url: str, commit_sha: str, framework: str) -> None:
-    _counterfactual_jobs[job_id]["status"] = "running"
+    _set_job_status(job_id, "running")
     repo_dir = None
     try:
         repo_dir = clone_repository(repo_url)
         result = counterfactual.run_counterfactual(repo_dir, commit_sha, framework)
-        _counterfactual_jobs[job_id] = {
-            "status": "completed",
-            "error": result.error,
-            "result": {
+
+        _set_job_status(
+            job_id,
+            "completed",
+            error=result.error,
+            result={
                 "commit_sha": result.commit_sha,
                 "short_sha": result.short_sha,
                 "framework": result.framework,
@@ -188,12 +202,29 @@ def _run_counterfactual_job(job_id: str, analysis_id: str, repo_url: str, commit
                 "baseline_timed_out": result.baseline.timed_out,
                 "without_commit_timed_out": result.without_commit.timed_out,
             },
-        }
+        )
+
+        # Write the outcome back into the persisted analysis too, not just
+        # this job row — the dashboard's SECONDARY FINDINGS section reads
+        # Analysis.result()["regressions"], not the job table.
+        db = SessionLocal()
+        try:
+            row = db.get(Analysis, analysis_id)
+            if row is not None and row.status == "completed":
+                stored = row.result()
+                stored["regressions"] = regression_detection.apply_counterfactual_result(
+                    stored.get("regressions", {}), result
+                )
+                row.set_result(stored)
+                db.commit()
+        finally:
+            db.close()
+
     except Exception as exc:  # noqa: BLE001
         logging.getLogger("autopsy.main").exception(
             "Counterfactual job %s failed for analysis %s, commit %s", job_id, analysis_id, commit_sha
         )
-        _counterfactual_jobs[job_id] = {"status": "failed", "error": str(exc)[:2000], "result": None}
+        _set_job_status(job_id, "failed", error=str(exc)[:2000])
     finally:
         if repo_dir is not None:
             cleanup_workdir(repo_dir)
@@ -214,8 +245,9 @@ def start_counterfactual(
     and test_frameworks already recorded for this analysis. Deliberately
     on-demand rather than run automatically for every suspect: each run
     clones the repo again and executes its test suite, which is expensive
-    and carries real code-execution risk (see module note above) — only
-    worth paying for the specific commit a user is actually investigating.
+    and carries real code-execution risk (see counterfactual.py's module
+    docstring) — only worth paying for the specific commit a user is
+    actually investigating.
     """
     result = _completed_result(analysis_id, db)
     row = _get_or_404(db, analysis_id)
@@ -235,7 +267,12 @@ def start_counterfactual(
         )
 
     job_id = uuid.uuid4().hex
-    _counterfactual_jobs[job_id] = {"status": "queued", "error": None, "result": None}
+    job_row = CounterfactualJob(
+        id=job_id, analysis_id=analysis_id, commit_sha=req.commit_sha, status="queued"
+    )
+    db.add(job_row)
+    db.commit()
+
     background_tasks.add_task(
         _run_counterfactual_job, job_id, analysis_id, row.repo_url, req.commit_sha, framework
     )
@@ -243,11 +280,11 @@ def start_counterfactual(
 
 
 @app.get("/api/counterfactual/{job_id}")
-def get_counterfactual_job(job_id: str):
-    job = _counterfactual_jobs.get(job_id)
-    if job is None:
+def get_counterfactual_job(job_id: str, db: Session = Depends(get_session)):
+    row = db.get(CounterfactualJob, job_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Counterfactual job not found.")
-    return job
+    return {"status": row.status, "error": row.error, "result": row.result()}
 
 
 @app.get("/api/analysis/{analysis_id}/regressions")

@@ -120,6 +120,14 @@ def run_analysis(analysis_id: str, repo_url: str) -> None:
             has_weak_test_signal=has_weak_test_signal,
         )
 
+        # NEW: write each suspect's confidence/summary back onto its commit
+        # node before the graph is serialized, so the persisted graph JSON
+        # is self-contained — the frontend can style/filter nodes by
+        # suspect_confidence directly from GET /graph without a second
+        # fetch or a client-side join against the `suspects` list. Must
+        # run after rank_suspects() and before graph_to_json() below.
+        evidence_graph.annotate_suspect_confidence(g, suspects)
+
         # Best-effort: look up real CI status for the top suspects via
         # GitHub's public Checks API. Never allowed to fail the analysis —
         # see _try_find_confirmed_regression's docstring.

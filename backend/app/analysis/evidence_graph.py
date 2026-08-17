@@ -10,7 +10,7 @@ Node kinds: commit, file, function, dependency, test, failure, author, change
 Edge kinds: COMMIT_CHANGED_FILE, COMMIT_CHANGED_DEPENDENCY,
             FILE_CONTAINS_FUNCTION, FUNCTION_USED_BY_TEST,
             COMMIT_PRECEDED_FAILURE, FILE_DEPENDS_ON_PACKAGE,
-            COMMIT_AUTHORED_BY
+            COMMIT_AUTHORED_BY, CALLS
 """
 from __future__ import annotations
 
@@ -102,6 +102,8 @@ def build_evidence_graph(
                 name=fn.name,
                 file=fa.path,
                 lineno=fn.lineno,
+                args=fn.args,
+                guard_count=fn.guard_count,
             )
             g.add_edge(file_id, fn_id, kind="FILE_CONTAINS_FUNCTION")
 
@@ -119,6 +121,34 @@ def build_evidence_graph(
         for name in called_names:
             if name in non_test_functions:
                 g.add_edge(non_test_functions[name], test_id, kind="FUNCTION_USED_BY_TEST")
+
+    # --- Function -> function CALLS edges (real call sites, not just names) -
+    # Built across every function in the repo (test and non-test) so Signal 9
+    # in why_analysis can find *every* caller of a function whose signature
+    # changed — including callers in files the commit itself never touched,
+    # which is exactly the "nobody updated the call site" case it looks for.
+    # Name-based, like FUNCTION_USED_BY_TEST above: two functions with the
+    # same name in different files/classes are not distinguished. That's a
+    # known heuristic limit (see README "known limitations"), not new here.
+    all_functions_by_name: dict[str, list[str]] = {}
+    for fa in file_analyses:
+        for fn in fa.functions:
+            all_functions_by_name.setdefault(fn.name, []).append(f"function:{fa.path}::{fn.name}")
+
+    for fa in file_analyses:
+        for fn in fa.functions:
+            caller_id = f"function:{fa.path}::{fn.name}"
+            for cs in fn.call_sites:
+                for callee_id in all_functions_by_name.get(cs.name, []):
+                    if callee_id == caller_id:
+                        continue  # skip direct self-recursion
+                    g.add_edge(
+                        caller_id, callee_id,
+                        kind="CALLS",
+                        arg_count=cs.arg_count,
+                        keyword_args=cs.keyword_args,
+                        lineno=cs.lineno,
+                    )
 
     # --- Dependency nodes ---------------------------------------------------
     for dep_file in detect_dependency_files(repo_path):

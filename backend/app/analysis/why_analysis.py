@@ -26,6 +26,8 @@ from app.analysis.dependency_parser import (
     diff_dependency_manifest,
     _is_dev_dependency,
 )
+from app.analysis.git_history import get_file_content_at_commit
+from app.analysis.static_python import analyze_python_source
 
 DEPENDENCY_MANIFESTS = {
     "requirements.txt", "pyproject.toml", "package.json",
@@ -189,6 +191,167 @@ def _score_dependency_signal(
         evidence.append(EvidenceItem(
             "FACT", f"Dev-only dependency changed: {', '.join(dev_changed)}"
         ))
+
+    return score, evidence, reasons
+
+
+def _parent_and_current_analysis(
+    g: nx.MultiDiGraph, commit_node: str, path: str
+) -> tuple["FileAnalysis | None", "FileAnalysis | None"]:  # noqa: F821
+    """
+    Parse a Python file's content at this commit and at its parent, via git
+    blob reads (no checkout). Returns (None, None) if either read fails, the
+    file didn't exist at one side, or repo_path/parent isn't known — callers
+    treat that as "nothing to compare" and skip.
+    """
+    repo_path = g.graph.get("repo_path")
+    commit_sha = g.nodes[commit_node].get("sha")
+    parents = g.nodes[commit_node].get("parents") or []
+    parent_sha = parents[0] if parents else None
+    if not repo_path or not commit_sha or not parent_sha:
+        return None, None
+
+    curr_text = get_file_content_at_commit(repo_path, commit_sha, path)
+    prev_text = get_file_content_at_commit(repo_path, parent_sha, path)
+    if curr_text is None or prev_text is None:
+        return None, None
+
+    try:
+        curr_fa = analyze_python_source(curr_text, path)
+        prev_fa = analyze_python_source(prev_text, path)
+    except Exception:
+        return None, None
+
+    if curr_fa.parse_error or prev_fa.parse_error:
+        return None, None
+
+    return prev_fa, curr_fa
+
+
+def _score_removed_guard_signal(
+    g: nx.MultiDiGraph, commit_node: str, changed_files: list[tuple[str, dict]]
+) -> tuple[float, list[EvidenceItem], list[str]]:
+    """
+    Signal 8: a function lost validation logic (a `raise` or `assert`)
+    between this commit and its parent, with nothing added back in its
+    place. A raw line-count diff (Signal 2) can't tell "removed a guard
+    clause" from "removed a comment" — this compares parsed function bodies
+    on each side, so it's specific to actual control-flow loss.
+
+    Deliberately conservative: only fires when a function present on *both*
+    sides has a lower guard_count on the new side. A function removed
+    entirely is a different (much louder) signal and isn't double-counted
+    here.
+    """
+    score = 0.0
+    evidence: list[EvidenceItem] = []
+    reasons: list[str] = []
+
+    dropped: list[tuple[str, str, int, int]] = []
+    for fnode, fdata in changed_files:
+        path = g.nodes[fnode].get("path", fnode)
+        if fdata.get("change_type") != "M" or not path.endswith(".py"):
+            continue
+        prev_fa, curr_fa = _parent_and_current_analysis(g, commit_node, path)
+        if prev_fa is None or curr_fa is None:
+            continue
+
+        curr_by_name = {fn.name: fn for fn in curr_fa.functions}
+        for prev_fn in prev_fa.functions:
+            curr_fn = curr_by_name.get(prev_fn.name)
+            if curr_fn is None:
+                continue
+            if curr_fn.guard_count < prev_fn.guard_count:
+                dropped.append((prev_fn.name, path, prev_fn.guard_count, curr_fn.guard_count))
+
+    if dropped:
+        score += min(0.30, 0.15 * len(dropped))
+        sample = ", ".join(
+            f"{name}() in {path} ({before}\u2192{after} guard statements)"
+            for name, path, before, after in dropped[:3]
+        )
+        evidence.append(EvidenceItem(
+            "FACT",
+            f"Function(s) lost validation logic (raise/assert count decreased, nothing "
+            f"added back): {sample}",
+        ))
+        reasons.append("removed input-validation logic")
+
+    return score, evidence, reasons
+
+
+def _score_signature_break_signal(
+    g: nx.MultiDiGraph, commit_node: str, changed_files: list[tuple[str, dict]]
+) -> tuple[float, list[EvidenceItem], list[str]]:
+    """
+    Signal 9: a function's parameter order changed in this commit, and a
+    real call site elsewhere in the repo (found via CALLS edges — actual
+    positional-argument-count matching, not name matching) still calls it
+    positionally with the old argument count, in a file this commit never
+    touched. This is the sharpest structural signal AUTOPSY can raise
+    without executing code: the call site will silently receive arguments
+    in the wrong slots.
+
+    Scoped narrowly on purpose: only fires when the parameter *set* is
+    identical and just the *order* changed (a same-name reorder), since
+    that's the case that's silent — a renamed or added/removed parameter
+    would usually be a TypeError at call time, which is a different (and
+    louder, test-suite-visible) failure mode already partly covered by
+    Signal 4.
+    """
+    score = 0.0
+    evidence: list[EvidenceItem] = []
+    reasons: list[str] = []
+
+    changed_file_paths = {g.nodes[v].get("path", v) for v, _ in changed_files}
+    breaks: list[tuple[str, str, list[str], list[str], str, str]] = []
+
+    for fnode, fdata in changed_files:
+        path = g.nodes[fnode].get("path", fnode)
+        if fdata.get("change_type") != "M" or not path.endswith(".py"):
+            continue
+        prev_fa, curr_fa = _parent_and_current_analysis(g, commit_node, path)
+        if prev_fa is None or curr_fa is None:
+            continue
+
+        curr_by_name = {fn.name: fn for fn in curr_fa.functions}
+        for prev_fn in prev_fa.functions:
+            curr_fn = curr_by_name.get(prev_fn.name)
+            if curr_fn is None or curr_fn.args == prev_fn.args:
+                continue
+            if set(curr_fn.args) != set(prev_fn.args):
+                continue  # not a pure reorder — different, louder failure mode
+
+            fn_id = f"function:{path}::{prev_fn.name}"
+            if fn_id not in g:
+                continue
+
+            for caller_id, _, edata in g.in_edges(fn_id, data=True):
+                if edata.get("kind") != "CALLS" or edata.get("keyword_args"):
+                    continue
+                if edata.get("arg_count") != len(prev_fn.args):
+                    continue
+                caller_data = g.nodes[caller_id]
+                caller_file = caller_data.get("file", "")
+                if caller_file in changed_file_paths:
+                    continue  # caller was updated in this same commit
+                breaks.append((
+                    prev_fn.name, path, prev_fn.args, curr_fn.args,
+                    caller_data.get("name", "?"), caller_file,
+                ))
+
+    if breaks:
+        score += min(0.45, 0.35 + 0.05 * (len(breaks) - 1))
+        name, path, old_args, new_args, caller_name, caller_file = breaks[0]
+        evidence.append(EvidenceItem(
+            "FACT",
+            f"{name}() in {path} had its parameter order changed "
+            f"({', '.join(old_args)} \u2192 {', '.join(new_args)}), but {caller_name}() in "
+            f"{caller_file} still calls it positionally with the old argument count and "
+            f"was not touched in this commit — its arguments will silently land in the "
+            f"wrong slots.",
+        ))
+        reasons.append("a function signature change with an un-updated positional caller")
 
     return score, evidence, reasons
 

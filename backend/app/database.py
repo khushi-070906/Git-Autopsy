@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import Column, DateTime, String, Text, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -13,6 +13,11 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
 
+def _utcnow() -> datetime:
+    """Timezone-aware replacement for the deprecated datetime.utcnow()."""
+    return datetime.now(timezone.utc)
+
+
 class Analysis(Base):
     __tablename__ = "analyses"
 
@@ -20,8 +25,8 @@ class Analysis(Base):
     repo_url = Column(String, nullable=False)
     status = Column(String, nullable=False, default="queued")
     error = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     # JSON blobs — SQLite has no native JSON type, so store as text.
     result_json = Column(Text, nullable=True)
@@ -44,8 +49,8 @@ class CounterfactualJob(Base):
     commit_sha = Column(String, nullable=False)
     status = Column(String, nullable=False, default="queued")
     error = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     # Same JSON-as-text pattern as Analysis.result_json — SQLite has no
     # native JSON type.

@@ -482,6 +482,19 @@ def _score_commit(
         ))
         reasons.append("limited commit history from this author in this repo")
 
+    # Signal 8: removed validation/guard logic (see _score_removed_guard_signal).
+    guard_score, guard_evidence, guard_reasons = _score_removed_guard_signal(g, commit_node, changed_files)
+    score += guard_score
+    evidence.extend(guard_evidence)
+    reasons.extend(guard_reasons)
+
+    # Signal 9: signature change with an un-updated positional caller
+    # (see _score_signature_break_signal).
+    sig_score, sig_evidence, sig_reasons = _score_signature_break_signal(g, commit_node, changed_files)
+    score += sig_score
+    evidence.extend(sig_evidence)
+    reasons.extend(sig_reasons)
+
     # Signal 7: merge-commit dampening. A merge commit's diff typically
     # represents the union of already-reviewed branch commits (each of
     # which is scored independently elsewhere in this same pass) — scoring

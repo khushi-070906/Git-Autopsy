@@ -88,6 +88,38 @@ def extract_history(repo_path: Path, max_commits: int = 500) -> list[CommitRecor
     return records
 
 
+def get_commit_diff(repo_path: Path, sha: str, max_chars: int = 20000) -> str:
+    """
+    Return the unified diff text for a single commit against its first
+    parent (or against the empty tree, for a repo's very first commit).
+    Read-only — uses GitPython's Diffable.diff(create_patch=True), which
+    never executes repository code. Truncated to max_chars so one huge
+    generated-file commit can't blow up a response payload.
+    """
+    repo = git.Repo(str(repo_path))
+    commit = repo.commit(sha)
+    parent = commit.parents[0] if commit.parents else None
+    try:
+        # NULL_TREE is a GitPython sentinel understood by the Diffable API
+        # (parent.diff / commit.diff) — it is NOT a valid arg to the raw
+        # `git diff` CLI via repo.git.diff(), which is why this goes
+        # through commit.diff() rather than a subprocess/CLI call.
+        diffs = (parent.diff(commit, create_patch=True) if parent is not None
+                 else commit.diff(git.NULL_TREE, create_patch=True))
+        parts = []
+        for d in diffs:
+            if d.diff:
+                parts.append(d.diff.decode("utf-8", errors="replace") if isinstance(d.diff, bytes) else d.diff)
+        diff_text = "\n".join(parts)
+    except Exception as exc:  # noqa: BLE001
+        return f"(unable to generate diff: {exc})"
+
+    if len(diff_text) > max_chars:
+        omitted = len(diff_text) - max_chars
+        diff_text = diff_text[:max_chars] + f"\n... (truncated, {omitted} more characters)"
+    return diff_text
+
+
 def get_file_content_at_commit(repo_path: Path, sha: str, file_path: str) -> Optional[str]:
     """Read a file's content as it existed at a specific commit, without checkout."""
     repo = git.Repo(str(repo_path))

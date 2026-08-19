@@ -10,7 +10,7 @@ Node kinds: commit, file, function, dependency, test, failure, author, change
 Edge kinds: COMMIT_CHANGED_FILE, COMMIT_CHANGED_DEPENDENCY,
             FILE_CONTAINS_FUNCTION, FUNCTION_USED_BY_TEST,
             COMMIT_PRECEDED_FAILURE, FILE_DEPENDS_ON_PACKAGE,
-            COMMIT_AUTHORED_BY, CALLS
+            COMMIT_AUTHORED_BY, CALLS, IMPORTS
 """
 from __future__ import annotations
 
@@ -22,6 +22,58 @@ from app.analysis.dependency_parser import parse_dependency_file
 from app.analysis.detect import detect_dependency_files
 from app.analysis.git_history import CommitRecord
 from app.analysis.static_python import FileAnalysis
+
+
+def _module_name_for_path(rel_path: str) -> str:
+    """
+    Convert a repo-relative .py file path to its dotted module name, e.g.
+    'app/analysis/git_history.py' -> 'app.analysis.git_history',
+    'app/__init__.py' -> 'app'.
+    """
+    p = rel_path[:-3] if rel_path.endswith(".py") else rel_path
+    parts = p.split("/")
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _resolve_local_imports(file_analyses: list[FileAnalysis]) -> dict[str, set[str]]:
+    """
+    Best-effort resolution of each Python file's imports to other files in
+    *this* repo — most imports are external packages and simply won't
+    match, which is expected and fine; only in-repo edges are returned.
+
+    Matching is exact-module-path first (`import app.analysis.git_history`),
+    then a same-tail-segment fallback (`mod_name.endswith("." + imp)`) to
+    catch relative imports like `from .git_history import X` — ast records
+    the module as just "git_history", not the package-qualified path.
+    Same name-based-heuristic spirit as CALLS/FUNCTION_USED_BY_TEST
+    elsewhere in this file: two same-named modules in unrelated packages
+    could collide. Acceptable for a "here's the rough shape of the
+    codebase" graph, not a claim of perfect resolution.
+    """
+    module_to_path: dict[str, str] = {}
+    for fa in file_analyses:
+        if fa.path.endswith(".py"):
+            module_to_path[_module_name_for_path(fa.path)] = fa.path
+
+    result: dict[str, set[str]] = {}
+    for fa in file_analyses:
+        targets: set[str] = set()
+        for imp in fa.imports:
+            direct = module_to_path.get(imp)
+            if direct and direct != fa.path:
+                targets.add(direct)
+                continue
+            for mod_name, path in module_to_path.items():
+                if path == fa.path:
+                    continue
+                if mod_name == imp or mod_name.endswith("." + imp):
+                    targets.add(path)
+                    break
+        if targets:
+            result[fa.path] = targets
+    return result
 
 
 def build_evidence_graph(
@@ -149,6 +201,20 @@ def build_evidence_graph(
                         keyword_args=cs.keyword_args,
                         lineno=cs.lineno,
                     )
+
+    # --- File -> file IMPORTS edges (local, in-repo imports only) ----------
+    # External-package imports never match _resolve_local_imports and are
+    # correctly dropped here — package-level dependencies are already
+    # tracked separately via FILE_DEPENDS_ON_PACKAGE below.
+    for importer_path, targets in _resolve_local_imports(file_analyses).items():
+        importer_id = f"file:{importer_path}"
+        if importer_id not in g:
+            g.add_node(importer_id, kind="file", path=importer_path)
+        for target_path in targets:
+            target_id = f"file:{target_path}"
+            if target_id not in g:
+                g.add_node(target_id, kind="file", path=target_path)
+            g.add_edge(importer_id, target_id, kind="IMPORTS")
 
     # --- Dependency nodes ---------------------------------------------------
     for dep_file in detect_dependency_files(repo_path):

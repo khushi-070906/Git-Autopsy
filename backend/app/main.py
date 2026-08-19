@@ -17,10 +17,11 @@ from app.database import Analysis, CounterfactualJob, SessionLocal, get_session,
 from app.pipeline import run_analysis
 from app.security import InvalidRepositoryURL, validate_github_url
 from app.analysis import badge
+from app.analysis import git_history
 from app.analysis.evidence_graph import evidence_for_node_json
 from app.analysis import counterfactual
 from app.analysis import regression_detection
-from app.analysis.cloner import clone_repository, cleanup_workdir
+from app.analysis.cloner import CloneError, clone_repository, cleanup_workdir
 
 
 @asynccontextmanager
@@ -320,6 +321,78 @@ def get_history(analysis_id: str, db: Session = Depends(get_session)):
         "commits": result["commits"],
         "functions": [n for n in result["graph"]["nodes"] if n.get("kind") == "function"],
     }
+
+
+@app.get("/api/analysis/{analysis_id}/code-graph")
+def get_code_graph(analysis_id: str, db: Session = Depends(get_session)):
+    """
+    NEW. The repo's own internal structure — file and function nodes, plus
+    FILE_CONTAINS_FUNCTION, IMPORTS (file -> file, in-repo imports only),
+    and CALLS (function -> function, from real call-site data) edges —
+    filtered out of the full evidence graph.
+
+    Distinct from GET .../dependencies: that endpoint is about *external
+    package* manifests (requirements.txt entries etc.), this one is about
+    how the repo's own files and functions depend on each other.
+    """
+    result = _completed_result(analysis_id, db)
+    graph = result["graph"]
+    keep_node_kinds = {"file", "function"}
+    keep_edge_kinds = {"FILE_CONTAINS_FUNCTION", "IMPORTS", "CALLS"}
+    nodes = [n for n in graph["nodes"] if n.get("kind") in keep_node_kinds]
+
+    # CALLS is a multi-edge in the underlying graph (one edge per call
+    # site, since Signal 9 needs each site's own arg count/keyword args) —
+    # a function called 8 times from the same caller would otherwise show
+    # as 8 identical arrows here. Dedupe by (source, target, kind) for this
+    # view only; the multi-edge data underneath is untouched.
+    seen: set[tuple[str, str, str]] = set()
+    edges = []
+    for e in graph["edges"]:
+        if e.get("kind") not in keep_edge_kinds:
+            continue
+        key = (e.get("source"), e.get("target"), e.get("kind"))
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append(e)
+
+    return {"nodes": nodes, "edges": edges}
+
+
+@app.get("/api/analysis/{analysis_id}/commit/{sha}/diff")
+@limiter.limit(ANALYZE_RATE_LIMIT)
+def get_commit_diff_endpoint(
+    request: Request, analysis_id: str, sha: str, db: Session = Depends(get_session)
+):
+    """
+    NEW. Unified diff text for one suspect commit against its parent.
+
+    The cloned repo isn't kept around after the analysis pipeline finishes
+    (see pipeline.py's cleanup_workdir call) — only the JSON result is
+    persisted — so this re-clones on demand, exactly like the
+    counterfactual-replay endpoint above, reads the diff, then cleans up
+    immediately. Rate-limited the same way for the same reason: cloning is
+    the expensive part, not the diff read itself.
+    """
+    result = _completed_result(analysis_id, db)
+    row = _get_or_404(db, analysis_id)
+
+    valid_shas = {c["sha"] for c in result["commits"]}
+    if sha not in valid_shas:
+        raise HTTPException(status_code=400, detail="sha not found in this analysis.")
+
+    repo_dir = None
+    try:
+        repo_dir = clone_repository(row.repo_url)
+        diff_text = git_history.get_commit_diff(repo_dir, sha)
+    except CloneError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not clone repository to fetch diff: {exc}")
+    finally:
+        if repo_dir is not None:
+            cleanup_workdir(repo_dir)
+
+    return {"sha": sha, "diff": diff_text}
 
 
 @app.get("/health")

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { AnalysisResult, getAnalysis, startAnalysis } from "./api";
 import { EvidenceTag } from "./EvidenceTag";
 import { EvidenceGraphView } from "./EvidenceGraphView";
+import { CodeGraphView } from "./CodeGraphView";
 import { VitalsMonitor } from "./VitalsMonitor";
 import { ErrorBoundary } from "./ErrorBoundary";
 
@@ -342,6 +343,10 @@ function Dashboard({ result, onReset, onRefresh }: { result: AnalysisResult; onR
 
       <Section title="SYSTEM ANATOMY">
         <EvidenceGraphView analysisId={result.id} nodes={graph.nodes} edges={graph.edges} onCounterfactualComplete={onRefresh} />
+      </Section>
+
+      <Section title="DEPENDENCY MAP">
+        <CodeGraphView analysisId={result.id} />
       </Section>
     </div>
   );

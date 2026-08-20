@@ -128,3 +128,21 @@ export async function getCounterfactualJob(jobId: string): Promise<Counterfactua
   if (!resp.ok) throw new Error("Failed to fetch counterfactual job status.");
   return resp.json();
 }
+
+// --- Code dependency graph -----------------------------------------------
+//
+// Mirrors main.py's GET /api/analysis/{id}/code-graph: file and function
+// nodes plus FILE_CONTAINS_FUNCTION/IMPORTS/CALLS edges, filtered out of
+// the full evidence graph and de-duplicated (one arrow per caller/callee
+// pair, not one per call site).
+
+export interface CodeGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export async function getCodeGraph(analysisId: string): Promise<CodeGraph> {
+  const resp = await fetch(`${BASE}/analysis/${analysisId}/code-graph`);
+  if (!resp.ok) throw new Error("Failed to fetch code dependency graph.");
+  return resp.json();
+}

@@ -13,6 +13,7 @@ interface SimNode {
   label: string;
   kind: string;
   isTest: boolean;
+  degree: number;
   x: number;
   y: number;
 }
@@ -29,8 +30,14 @@ const EDGE_COLOR: Record<string, string> = {
   FILE_CONTAINS_FUNCTION: "var(--hairline)",
 };
 
+// Large function-level graphs can run into the thousands of nodes — well
+// past what's readable (or fast) as a hand-rolled force layout. Past this
+// count we keep only the most-connected nodes and say so, rather than
+// silently making the browser tab hang.
+const MAX_RENDERED_NODES = 400;
+
 function shortLabel(n: GraphNode): string {
-  const path = String(n.path ?? n.id);
+  const path = String(n.path ?? n.file ?? n.id);
   const base = path.split("/").pop() || path;
   return n.kind === "function" ? String(n.name ?? base) : base;
 }
@@ -73,19 +80,87 @@ function toFileLevel(nodes: GraphNode[], edges: GraphEdge[]): { nodes: GraphNode
   return { nodes: fileNodes, edges: fileEdges };
 }
 
+// Caps to the MAX_RENDERED_NODES most-connected nodes (by degree across
+// the full edge set, computed before capping so it reflects true
+// importance, not importance-after-truncation) and drops any edge that
+// now dangles. Returns the cap info so the UI can say what happened.
+function capByDegree(
+  nodes: GraphNode[],
+  edges: GraphEdge[]
+): { nodes: GraphNode[]; edges: GraphEdge[]; totalBeforeCap: number } {
+  const totalBeforeCap = nodes.length;
+  if (nodes.length <= MAX_RENDERED_NODES) return { nodes, edges, totalBeforeCap };
+
+  const degree: Record<string, number> = {};
+  for (const e of edges) {
+    degree[e.source] = (degree[e.source] || 0) + 1;
+    degree[e.target] = (degree[e.target] || 0) + 1;
+  }
+  const kept = [...nodes]
+    .sort((a, b) => (degree[b.id] || 0) - (degree[a.id] || 0))
+    .slice(0, MAX_RENDERED_NODES);
+  const keptIds = new Set(kept.map((n) => n.id));
+  const keptEdges = edges.filter((e) => keptIds.has(e.source) && keptIds.has(e.target));
+  return { nodes: kept, edges: keptEdges, totalBeforeCap };
+}
+
 const W = 860;
 const H = 560;
 
+// Grid-based repulsion: only compares each node against others in its own
+// and adjacent cells, instead of every pair. Turns the O(n^2) inner loop
+// into roughly O(n) for a reasonably spread-out layout, which is what
+// keeps a few-hundred-node function-level graph interactive instead of
+// freezing the tab.
+function applyRepulsion(sim: SimNode[], cellSize: number, maxDist: number, strength: number) {
+  const buckets = new Map<string, SimNode[]>();
+  const cellKey = (x: number, y: number) => `${Math.floor(x / cellSize)}:${Math.floor(y / cellSize)}`;
+  for (const n of sim) {
+    const k = cellKey(n.x, n.y);
+    let arr = buckets.get(k);
+    if (!arr) buckets.set(k, (arr = []));
+    arr.push(n);
+  }
+  for (const n of sim) {
+    const cx = Math.floor(n.x / cellSize);
+    const cy = Math.floor(n.y / cellSize);
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const arr = buckets.get(`${cx + dx}:${cy + dy}`);
+        if (!arr) continue;
+        for (const other of arr) {
+          if (other === n) continue;
+          const ddx = n.x - other.x;
+          const ddy = n.y - other.y;
+          const dist = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+          if (dist > maxDist) continue;
+          const force = strength / (dist * dist);
+          n.x += (ddx / dist) * force;
+          n.y += (ddy / dist) * force;
+        }
+      }
+    }
+  }
+}
+
 function layout(nodes: GraphNode[], edges: GraphEdge[]): SimNode[] {
+  const degree: Record<string, number> = {};
+  for (const e of edges) {
+    degree[e.source] = (degree[e.source] || 0) + 1;
+    degree[e.target] = (degree[e.target] || 0) + 1;
+  }
+
   const sim: SimNode[] = nodes.map((n, i) => {
     const angle = (i / Math.max(nodes.length, 1)) * Math.PI * 2;
+    const r = 120 + (i % 3) * 40; // stagger the starting ring so large graphs don't start perfectly overlapped
     return {
       id: n.id,
       label: shortLabel(n),
       kind: n.kind,
       isTest: isTestPath(n),
-      x: W / 2 + Math.cos(angle) * 120 + (Math.random() - 0.5) * 20,
-      y: H / 2 + Math.sin(angle) * 120 + (Math.random() - 0.5) * 20,
+      degree: degree[n.id] || 0,
+      x: W / 2 + Math.cos(angle) * r + (Math.random() - 0.5) * 20,
+      y: H / 2 + Math.sin(angle) * r + (Math.random() - 0.5) * 20,
     };
   });
   const byId: Record<string, SimNode> = {};
@@ -94,23 +169,10 @@ function layout(nodes: GraphNode[], edges: GraphEdge[]): SimNode[] {
     .map((e) => ({ a: byId[e.source], b: byId[e.target] }))
     .filter((l) => l.a && l.b);
 
-  const iterations = sim.length > 120 ? 150 : 300;
+  const iterations = sim.length > 150 ? 220 : sim.length > 60 ? 260 : 320;
   for (let it = 0; it < iterations; it++) {
-    // repulsion, capped distance so far-apart nodes don't drift forever
-    for (let i = 0; i < sim.length; i++) {
-      for (let j = i + 1; j < sim.length; j++) {
-        const a = sim[i], b = sim[j];
-        let dx = a.x - b.x, dy = a.y - b.y;
-        let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-        if (dist > 220) continue;
-        const force = (700 / (dist * dist)) * 4;
-        dx = (dx / dist) * force;
-        dy = (dy / dist) * force;
-        a.x += dx; a.y += dy;
-        b.x -= dx; b.y -= dy;
-      }
-    }
-    // spring along edges
+    applyRepulsion(sim, 40, 220, 900);
+
     for (const { a, b } of links) {
       let dx = b.x - a.x, dy = b.y - a.y;
       const dist = Math.sqrt(dx * dx + dy * dy) || 1;
@@ -121,7 +183,6 @@ function layout(nodes: GraphNode[], edges: GraphEdge[]): SimNode[] {
       a.x += dx; a.y += dy;
       b.x -= dx; b.y -= dy;
     }
-    // gentle pull to center + clamp inside viewBox
     for (const n of sim) {
       n.x += (W / 2 - n.x) * 0.004;
       n.y += (H / 2 - n.y) * 0.004;
@@ -132,13 +193,23 @@ function layout(nodes: GraphNode[], edges: GraphEdge[]): SimNode[] {
   return sim;
 }
 
+interface ViewTransform {
+  x: number;
+  y: number;
+  k: number;
+}
+
 export function CodeGraphView({ analysisId }: { analysisId: string }) {
   const [raw, setRaw] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showFunctions, setShowFunctions] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
   const [positions, setPositions] = useState<SimNode[] | null>(null);
+  const [transform, setTransform] = useState<ViewTransform>({ x: 0, y: 0, k: 1 });
   const dragId = useRef<string | null>(null);
+  const panStart = useRef<{ px: number; py: number; tx: number; ty: number } | null>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -156,16 +227,40 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
     };
   }, [analysisId]);
 
-  const view = useMemo(() => {
+  const capped = useMemo(() => {
     if (!raw) return null;
-    return showFunctions ? raw : toFileLevel(raw.nodes, raw.edges);
+    const base = showFunctions ? raw : toFileLevel(raw.nodes, raw.edges);
+    return capByDegree(base.nodes, base.edges);
   }, [raw, showFunctions]);
 
   useEffect(() => {
-    if (!view) return;
+    if (!capped) return;
     setSelected(null);
-    setPositions(layout(view.nodes, view.edges));
-  }, [view]);
+    setTransform({ x: 0, y: 0, k: 1 });
+    setPositions(layout(capped.nodes, capped.edges));
+  }, [capped]);
+
+  // Native (non-React-synthetic) wheel listener so preventDefault reliably
+  // stops page scroll — React 17+ attaches wheel listeners as passive by
+  // default, which silently ignores e.preventDefault() in a JSX onWheel.
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    const onWheel = (ev: WheelEvent) => {
+      ev.preventDefault();
+      const rect = el.getBoundingClientRect();
+      const vx = ((ev.clientX - rect.left) / rect.width) * W;
+      const vy = ((ev.clientY - rect.top) / rect.height) * H;
+      setTransform((t) => {
+        const k = Math.min(5, Math.max(0.25, t.k * (ev.deltaY < 0 ? 1.12 : 0.89)));
+        const worldX = (vx - t.x) / t.k;
+        const worldY = (vy - t.y) / t.k;
+        return { k, x: vx - worldX * k, y: vy - worldY * k };
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
 
   const nodesById = useMemo(() => {
     const m: Record<string, SimNode> = {};
@@ -174,40 +269,52 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
   }, [positions]);
 
   const connected = useMemo(() => {
-    if (!selected || !view) return null;
-    const s = new Set<string>([selected]);
-    for (const e of view.edges) {
-      if (e.source === selected) s.add(e.target);
-      if (e.target === selected) s.add(e.source);
+    const focus = selected || hovered;
+    if (!focus || !capped) return null;
+    const s = new Set<string>([focus]);
+    for (const e of capped.edges) {
+      if (e.source === focus) s.add(e.target);
+      if (e.target === focus) s.add(e.source);
     }
     return s;
-  }, [selected, view]);
+  }, [selected, hovered, capped]);
+
+  const toViewBox = (ev: { clientX: number; clientY: number }) => {
+    const rect = svgRef.current!.getBoundingClientRect();
+    return {
+      vx: ((ev.clientX - rect.left) / rect.width) * W,
+      vy: ((ev.clientY - rect.top) / rect.height) * H,
+    };
+  };
 
   const onPointerMove = (ev: React.PointerEvent<SVGSVGElement>) => {
-    if (!dragId.current || !positions) return;
-    const svg = ev.currentTarget;
-    const rect = svg.getBoundingClientRect();
-    const x = ((ev.clientX - rect.left) / rect.width) * W;
-    const y = ((ev.clientY - rect.top) / rect.height) * H;
-    setPositions((prev) =>
-      (prev || []).map((n) => (n.id === dragId.current ? { ...n, x, y } : n))
-    );
+    if (dragId.current && positions) {
+      const { vx, vy } = toViewBox(ev);
+      const x = (vx - transform.x) / transform.k;
+      const y = (vy - transform.y) / transform.k;
+      setPositions((prev) => (prev || []).map((n) => (n.id === dragId.current ? { ...n, x, y } : n)));
+    } else if (panStart.current) {
+      const { vx, vy } = toViewBox(ev);
+      const { px, py, tx, ty } = panStart.current;
+      setTransform((t) => ({ ...t, x: tx + (vx - px), y: ty + (vy - py) }));
+    }
+  };
+
+  const endInteraction = () => {
+    dragId.current = null;
+    panStart.current = null;
   };
 
   if (error) return <div style={{ color: "#c24a3f", fontSize: 13 }}>{error}</div>;
-  if (!raw || !view || !positions) {
+  if (!raw || !capped || !positions) {
     return <div style={{ color: "var(--paper-dim)", fontSize: 13 }}>Loading dependency graph...</div>;
   }
 
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 10, fontSize: 11 }}>
+      <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 16, marginBottom: 10, fontSize: 11 }}>
         <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", color: "var(--paper-dim)" }}>
-          <input
-            type="checkbox"
-            checked={showFunctions}
-            onChange={(e) => setShowFunctions(e.target.checked)}
-          />
+          <input type="checkbox" checked={showFunctions} onChange={(e) => setShowFunctions(e.target.checked)} />
           Show functions
         </label>
         <span style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--paper-dim)" }}>
@@ -232,72 +339,98 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
           <span style={{ width: 14, height: 1, background: "var(--dim)", display: "inline-block" }} />
           calls
         </span>
+        <button
+          onClick={() => setTransform({ x: 0, y: 0, k: 1 })}
+          style={{
+            marginLeft: "auto", fontSize: 11, background: "transparent", color: "var(--paper-dim)",
+            border: "1px solid var(--hairline)", borderRadius: 3, padding: "2px 8px", cursor: "pointer",
+          }}
+        >
+          Reset view
+        </button>
       </div>
 
       <svg
+        ref={svgRef}
         viewBox={`0 0 ${W} ${H}`}
-        style={{ width: "100%", height: 560, background: "var(--panel)", border: "1px solid var(--hairline)", borderRadius: 4 }}
+        style={{ width: "100%", height: 560, background: "var(--panel)", border: "1px solid var(--hairline)", borderRadius: 4, cursor: panStart.current ? "grabbing" : "grab" }}
+        onPointerDown={(e) => {
+          if (e.target === e.currentTarget) {
+            const { vx, vy } = toViewBox(e);
+            panStart.current = { px: vx, py: vy, tx: transform.x, ty: transform.y };
+          }
+        }}
         onPointerMove={onPointerMove}
-        onPointerUp={() => (dragId.current = null)}
-        onPointerLeave={() => (dragId.current = null)}
+        onPointerUp={endInteraction}
+        onPointerLeave={endInteraction}
         onClick={(e) => {
           if (e.target === e.currentTarget) setSelected(null);
         }}
       >
-        {view.edges.map((e, i) => {
-          const a = nodesById[e.source];
-          const b = nodesById[e.target];
-          if (!a || !b) return null;
-          const dim = connected && !(connected.has(e.source) && connected.has(e.target));
-          return (
-            <line
-              key={i}
-              x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-              stroke={EDGE_COLOR[e.kind] || "var(--hairline)"}
-              strokeWidth={e.kind === "IMPORTS" ? 1 : 0.6}
-              opacity={dim ? 0.06 : e.kind === "FILE_CONTAINS_FUNCTION" ? 0.25 : 0.5}
-            />
-          );
-        })}
-        {positions.map((n) => {
-          const dim = connected && !connected.has(n.id);
-          const color = n.kind === "function" ? NODE_COLOR.function : n.isTest ? NODE_COLOR.fileTest : NODE_COLOR.file;
-          return (
-            <g
-              key={n.id}
-              transform={`translate(${n.x},${n.y})`}
-              style={{ cursor: "pointer" }}
-              opacity={dim ? 0.2 : 1}
-              onPointerDown={() => (dragId.current = n.id)}
-              onClick={(e) => {
-                e.stopPropagation();
-                setSelected(n.id === selected ? null : n.id);
-              }}
-            >
-              <circle r={n.kind === "function" ? 3.5 : 6} fill={color} stroke="var(--panel)" strokeWidth={1.5} />
-              {(selected === n.id || (!connected && n.kind === "file")) && (
-                <text
-                  x={9} y={3}
-                  fontFamily="var(--font-mono)"
-                  fontSize={10}
-                  fill="var(--paper-dim)"
-                >
-                  {n.label}
-                </text>
-              )}
-              {connected && connected.has(n.id) && n.id !== selected && (
-                <text x={9} y={3} fontFamily="var(--font-mono)" fontSize={10} fill="var(--paper)">
-                  {n.label}
-                </text>
-              )}
-            </g>
-          );
-        })}
+        <g transform={`translate(${transform.x},${transform.y}) scale(${transform.k})`}>
+          {capped.edges.map((e, i) => {
+            const a = nodesById[e.source];
+            const b = nodesById[e.target];
+            if (!a || !b) return null;
+            const dim = connected && !(connected.has(e.source) && connected.has(e.target));
+            return (
+              <line
+                key={i}
+                x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+                stroke={EDGE_COLOR[e.kind] || "var(--hairline)"}
+                strokeWidth={(e.kind === "IMPORTS" ? 1 : 0.6) / transform.k}
+                opacity={dim ? 0.06 : e.kind === "FILE_CONTAINS_FUNCTION" ? 0.25 : 0.5}
+                style={{ transition: "opacity 120ms ease" }}
+              />
+            );
+          })}
+          {positions.map((n) => {
+            const dim = connected && !connected.has(n.id);
+            const focused = selected === n.id || hovered === n.id;
+            const showLabel = focused || (!connected && n.kind === "file") || (connected != null && connected.has(n.id));
+            const color = n.kind === "function" ? NODE_COLOR.function : n.isTest ? NODE_COLOR.fileTest : NODE_COLOR.file;
+            const r = (n.kind === "function" ? 3.5 : 5 + Math.min(4, n.degree * 0.4)) / transform.k;
+            return (
+              <g
+                key={n.id}
+                transform={`translate(${n.x},${n.y})`}
+                style={{ cursor: "pointer" }}
+                opacity={dim ? 0.2 : 1}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  dragId.current = n.id;
+                }}
+                onPointerEnter={() => setHovered(n.id)}
+                onPointerLeave={() => setHovered((h) => (h === n.id ? null : h))}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSelected(n.id === selected ? null : n.id);
+                }}
+              >
+                <circle r={r} fill={color} stroke="var(--panel)" strokeWidth={1.5 / transform.k}
+                  style={{ transition: "r 120ms ease" }} />
+                {showLabel && (
+                  <text
+                    x={9 / transform.k} y={3 / transform.k}
+                    fontFamily="var(--font-mono)"
+                    fontSize={10 / transform.k}
+                    fill={focused ? "var(--paper)" : "var(--paper-dim)"}
+                  >
+                    {n.label}
+                  </text>
+                )}
+              </g>
+            );
+          })}
+        </g>
       </svg>
       <div style={{ fontSize: 11, color: "var(--paper-dim)", marginTop: 6 }}>
-        {view.nodes.length} nodes, {view.edges.length} edges. Drag to rearrange, click a node to trace its
+        {capped.nodes.length} nodes, {capped.edges.length} edges
+        {capped.totalBeforeCap > capped.nodes.length &&
+          ` (showing the ${capped.nodes.length} most-connected of ${capped.totalBeforeCap})`}
+        . Scroll to zoom, drag the background to pan, drag a node to reposition, click a node to trace its
         connections.
       </div>
     </div>
   );
-}
+}  

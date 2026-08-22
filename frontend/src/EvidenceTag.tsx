@@ -8,7 +8,7 @@ const TAG_COLOR: Record<string, string> = {
 };
 
 export function EvidenceTag({ item }: { item: EvidenceItem }) {
-  const color = TAG_COLOR[item.kind] || "var(--paper-dim)";
+  const color = TAG_COLOR[item.kind] || "var(--dim)";
   return (
     <div
       style={{

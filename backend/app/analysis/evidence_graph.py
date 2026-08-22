@@ -258,6 +258,45 @@ def _looks_like_test_file(path: str) -> bool:
     return "test" in p.split("/")[-1] or p.split("/")[0] in {"tests", "test"}
 
 
+def find_import_cycles(graph_json: dict) -> list[list[str]]:
+    """
+    Circular in-repo imports (file A imports B imports ... imports A),
+    computed from the already-serialized graph JSON (graph_to_json's
+    output) rather than a live nx.MultiDiGraph — this is called from the
+    API layer, which only has the persisted JSON, not the in-memory graph
+    build_evidence_graph produced. Genuine code smell independent of any
+    specific commit; surfaced by the /code-graph endpoint as a top-level
+    "cycles" field, not tied into WHY-analysis scoring, since a cycle is a
+    standing property of the codebase's current shape, not evidence about
+    which commit is at fault.
+
+    Deduplicates rotations of the same cycle (A->B->C->A and B->C->A->B
+    are the same cycle) by sorting each to a canonical starting point.
+    """
+    path_by_id = {n["id"]: n.get("path", n["id"]) for n in graph_json.get("nodes", []) if n.get("kind") == "file"}
+    file_edges = [
+        (e["source"], e["target"]) for e in graph_json.get("edges", [])
+        if e.get("kind") == "IMPORTS" and e["source"] in path_by_id and e["target"] in path_by_id
+    ]
+    if not file_edges:
+        return []
+    file_graph = nx.DiGraph()
+    file_graph.add_edges_from(file_edges)
+
+    seen: set[tuple[str, ...]] = set()
+    cycles: list[list[str]] = []
+    for cycle in nx.simple_cycles(file_graph):
+        if len(cycle) < 2:
+            continue  # nx.simple_cycles can report self-loops as length-1; IMPORTS never self-loops (see build_evidence_graph), but guard anyway
+        min_idx = cycle.index(min(cycle))
+        canonical = tuple(cycle[min_idx:] + cycle[:min_idx])
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        cycles.append([path_by_id[n] for n in canonical])
+    return cycles
+
+
 def graph_to_json(g: nx.MultiDiGraph) -> dict:
     """Serialize the graph into a simple {nodes, edges} JSON shape for the API/frontend."""
     nodes = [{"id": n, **{k: v for k, v in data.items()}} for n, data in g.nodes(data=True)]

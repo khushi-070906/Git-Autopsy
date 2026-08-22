@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { GraphEdge, GraphNode, getCodeGraph } from "./api";
+import { CodeGraph, GraphEdge, GraphNode, getCodeGraph } from "./api";
 
 // No layout library is added here (the frontend deliberately only depends
 // on react/react-dom) — this runs a small, self-contained force
@@ -10,6 +10,7 @@ import { GraphEdge, GraphNode, getCodeGraph } from "./api";
 
 interface SimNode {
   id: string;
+  path: string;
   label: string;
   kind: string;
   isTest: boolean;
@@ -35,6 +36,10 @@ const EDGE_COLOR: Record<string, string> = {
 // count we keep only the most-connected nodes and say so, rather than
 // silently making the browser tab hang.
 const MAX_RENDERED_NODES = 400;
+
+function nodePath(n: { path?: unknown; file?: unknown; id: string }): string {
+  return String(n.path ?? n.file ?? n.id.replace(/^(file|function):/, "").split("::")[0]);
+}
 
 function shortLabel(n: GraphNode): string {
   const path = String(n.path ?? n.file ?? n.id);
@@ -155,6 +160,7 @@ function layout(nodes: GraphNode[], edges: GraphEdge[]): SimNode[] {
     const r = 120 + (i % 3) * 40; // stagger the starting ring so large graphs don't start perfectly overlapped
     return {
       id: n.id,
+      path: nodePath(n),
       label: shortLabel(n),
       kind: n.kind,
       isTest: isTestPath(n),
@@ -199,8 +205,23 @@ interface ViewTransform {
   k: number;
 }
 
-export function CodeGraphView({ analysisId }: { analysisId: string }) {
-  const [raw, setRaw] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] } | null>(null);
+export function CodeGraphView({
+  analysisId,
+  highlightFiles,
+  onFileNodeClick,
+}: {
+  analysisId: string;
+  /** Externally-driven highlight (e.g. "show this suspect's files here") —
+   * distinct from the internal click/hover selection, drawn as a
+   * persistent `--finding`-colored ring regardless of hover state. */
+  highlightFiles?: string[] | null;
+  /** Fired when a file node is clicked, in addition to the internal
+   * select/highlight-connections behavior — lets a parent (e.g. jump to
+   * the suspect that touched this file) react without this component
+   * knowing anything about suspects. */
+  onFileNodeClick?: (path: string) => void;
+}) {
+  const [raw, setRaw] = useState<CodeGraph | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showFunctions, setShowFunctions] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
@@ -232,6 +253,26 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
     const base = showFunctions ? raw : toFileLevel(raw.nodes, raw.edges);
     return capByDegree(base.nodes, base.edges);
   }, [raw, showFunctions]);
+
+  // Files involved in a circular-import cycle (from the backend's
+  // find_import_cycles) and the specific edges that form those cycles —
+  // computed once per raw graph load, independent of the file/function
+  // toggle, since cycles are always reported at file granularity.
+  const cycleFileSet = useMemo(() => new Set((raw?.cycles ?? []).flat()), [raw]);
+  const cycleEdgeKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const cycle of raw?.cycles ?? []) {
+      for (let i = 0; i < cycle.length; i++) {
+        const a = cycle[i], b = cycle[(i + 1) % cycle.length];
+        // cycle entries are file *paths*; edge source/target are node ids
+        // ("file:<path>") — normalize both sides to path for matching.
+        keys.add(`${a}->${b}`);
+      }
+    }
+    return keys;
+  }, [raw]);
+
+  const highlightSet = useMemo(() => new Set(highlightFiles ?? []), [highlightFiles]);
 
   useEffect(() => {
     if (!capped) return;
@@ -312,6 +353,20 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
 
   return (
     <div>
+      {raw.cycles.length > 0 && (
+        <details style={{ marginBottom: 10, fontSize: 12, color: "var(--tag-evidence)" }}>
+          <summary style={{ cursor: "pointer" }}>
+            ⚠ {raw.cycles.length} circular import {raw.cycles.length === 1 ? "cycle" : "cycles"} detected (dashed amber on the graph)
+          </summary>
+          <div style={{ marginTop: 6, color: "var(--dim)" }}>
+            {raw.cycles.map((c, i) => (
+              <div key={i} style={{ fontFamily: "var(--font-mono)", fontSize: 11, marginTop: 4 }}>
+                {c.join(" → ")} → {c[0]}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
       <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 16, marginBottom: 10, fontSize: 11 }}>
         <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", color: "var(--dim)" }}>
           <input type="checkbox" checked={showFunctions} onChange={(e) => setShowFunctions(e.target.checked)} />
@@ -388,6 +443,7 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
             if (!a || !b) return null;
             const dim = connected && !(connected.has(e.source) && connected.has(e.target));
             const active = connected && connected.has(e.source) && connected.has(e.target);
+            const inCycle = e.kind === "IMPORTS" && cycleEdgeKeys.has(`${a.path}->${b.path}`);
             // shorten the line so the arrowhead sits at the target node's
             // rim instead of under it
             const dx = b.x - a.x, dy = b.y - a.y;
@@ -398,9 +454,10 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
               <line
                 key={i}
                 x1={a.x} y1={a.y} x2={ex} y2={ey}
-                stroke={EDGE_COLOR[e.kind] || "var(--hairline)"}
-                strokeWidth={((e.kind === "IMPORTS" ? 1.1 : 0.7) * (active ? 1.8 : 1)) / transform.k}
-                opacity={dim ? 0.06 : e.kind === "FILE_CONTAINS_FUNCTION" ? 0.25 : active ? 0.9 : 0.5}
+                stroke={inCycle ? "var(--finding)" : EDGE_COLOR[e.kind] || "var(--hairline)"}
+                strokeWidth={((e.kind === "IMPORTS" ? 1.1 : 0.7) * (active || inCycle ? 1.8 : 1)) / transform.k}
+                strokeDasharray={inCycle ? `${4 / transform.k} ${3 / transform.k}` : undefined}
+                opacity={dim ? 0.06 : inCycle ? 0.95 : e.kind === "FILE_CONTAINS_FUNCTION" ? 0.25 : active ? 0.9 : 0.5}
                 markerEnd={e.kind === "FILE_CONTAINS_FUNCTION" ? undefined : `url(#arrow-${e.kind})`}
                 style={{ transition: "opacity 150ms ease, stroke-width 150ms ease" }}
               />
@@ -412,6 +469,8 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
             const showLabel = focused || (!connected && n.kind === "file") || (connected != null && connected.has(n.id));
             const color = n.kind === "function" ? NODE_COLOR.function : n.isTest ? NODE_COLOR.fileTest : NODE_COLOR.file;
             const r = (n.kind === "function" ? 3.5 : 5 + Math.min(4, n.degree * 0.4)) / transform.k;
+            const isHighlighted = n.kind === "file" && highlightSet.has(n.path);
+            const isCycleMember = n.kind === "file" && cycleFileSet.has(n.path);
             return (
               <g
                 key={n.id}
@@ -427,8 +486,27 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
                 onClick={(e) => {
                   e.stopPropagation();
                   setSelected(n.id === selected ? null : n.id);
+                  if (n.kind === "file" && onFileNodeClick) onFileNodeClick(n.path);
                 }}
               >
+                {isHighlighted && (
+                  <circle
+                    r={r + 7 / transform.k}
+                    fill="none"
+                    stroke="var(--finding)"
+                    strokeWidth={1.5 / transform.k}
+                    style={{ filter: "drop-shadow(0 0 4px var(--finding))" }}
+                  />
+                )}
+                {isCycleMember && (
+                  <circle
+                    r={r + (isHighlighted ? 12 : 7) / transform.k}
+                    fill="none"
+                    stroke="var(--tag-evidence)"
+                    strokeWidth={1 / transform.k}
+                    strokeDasharray={`${3 / transform.k} ${2 / transform.k}`}
+                  />
+                )}
                 {selected === n.id && (
                   <circle
                     r={r + 5 / transform.k}
@@ -448,12 +526,12 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
                     filter: focused ? "drop-shadow(0 0 5px currentColor)" : "drop-shadow(0 0 1.5px currentColor)",
                   }}
                 />
-                {showLabel && (
+                {(showLabel || isHighlighted || isCycleMember) && (
                   <text
                     x={9 / transform.k} y={3 / transform.k}
                     fontFamily="var(--font-mono)"
                     fontSize={10 / transform.k}
-                    fill={focused ? "var(--paper)" : "var(--dim)"}
+                    fill={focused || isHighlighted ? "var(--paper)" : "var(--dim)"}
                   >
                     {n.label}
                   </text>

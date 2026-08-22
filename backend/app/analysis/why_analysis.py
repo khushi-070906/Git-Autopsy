@@ -356,6 +356,56 @@ def _score_signature_break_signal(
     return score, evidence, reasons
 
 
+def _score_blast_radius_signal(
+    g: nx.MultiDiGraph, commit_node: str, changed_files: list[tuple[str, dict]]
+) -> tuple[float, list[EvidenceItem], list[str]]:
+    """
+    Signal 10: a general-riskiness modifier (same spirit as Signal 5's
+    hotspot signal, not a specific-bug-mechanics signal like 8/9) — a
+    commit that touches a file with many in-repo importers has a wider
+    blast radius than one touching a leaf file. Uses the IMPORTS edges
+    built in evidence_graph.py: direct importers only (not transitive),
+    kept deliberately conservative since a two-hop "importer of an
+    importer" relationship is a much weaker risk signal and quickly
+    balloons the count on any reasonably-connected codebase.
+
+    Modest weight by design (capped well below Signal 9's 0.45): a
+    highly-depended-on file being touched is a reason to pay closer
+    attention, not evidence that this specific commit did anything wrong.
+    """
+    score = 0.0
+    evidence: list[EvidenceItem] = []
+    reasons: list[str] = []
+
+    hub_hits: list[tuple[str, int, list[str]]] = []
+    for fnode, fdata in changed_files:
+        if fdata.get("change_type") not in ("M", "D"):
+            continue  # a newly-added file (A) has no pre-existing importers to break
+        importers = [
+            g.nodes[u].get("path", u)
+            for u, _, edata in g.in_edges(fnode, data=True)
+            if edata.get("kind") == "IMPORTS"
+        ]
+        if len(importers) >= 3:
+            path = g.nodes[fnode].get("path", fnode)
+            hub_hits.append((path, len(importers), importers))
+
+    if hub_hits:
+        hub_hits.sort(key=lambda h: h[1], reverse=True)
+        total_importers = sum(h[1] for h in hub_hits)
+        score += min(0.20, 0.04 * total_importers)
+        path, count, importers = hub_hits[0]
+        sample = ", ".join(importers[:4]) + (f", +{count - 4} more" if count > 4 else "")
+        evidence.append(EvidenceItem(
+            "FACT",
+            f"{path} is imported by {count} other file(s) in this repo ({sample}) — "
+            f"a change here has a wider blast radius than a leaf file.",
+        ))
+        reasons.append("touched a widely-depended-on file")
+
+    return score, evidence, reasons
+
+
 def _score_commit(
     g: nx.MultiDiGraph, commit_node: str, repo_stats: dict
 ) -> tuple[float, list[EvidenceItem], str]:
@@ -494,6 +544,14 @@ def _score_commit(
     score += sig_score
     evidence.extend(sig_evidence)
     reasons.extend(sig_reasons)
+
+    # Signal 10: blast radius — touching a widely-imported file (see
+    # _score_blast_radius_signal). A general-riskiness modifier, same
+    # spirit as Signal 5, not a specific-bug-mechanics signal like 8/9.
+    blast_score, blast_evidence, blast_reasons = _score_blast_radius_signal(g, commit_node, changed_files)
+    score += blast_score
+    evidence.extend(blast_evidence)
+    reasons.extend(blast_reasons)
 
     # Signal 7: merge-commit dampening. A merge commit's diff typically
     # represents the union of already-reviewed branch commits (each of

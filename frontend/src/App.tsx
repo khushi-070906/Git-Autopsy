@@ -3,6 +3,7 @@ import { AnalysisResult, getAnalysis, startAnalysis } from "./api";
 import { EvidenceTag } from "./EvidenceTag";
 import { EvidenceGraphView } from "./EvidenceGraphView";
 import { CodeGraphView } from "./CodeGraphView";
+import { CommitDiffView } from "./CommitDiffView";
 import { VitalsMonitor } from "./VitalsMonitor";
 import { ErrorBoundary } from "./ErrorBoundary";
 
@@ -235,6 +236,34 @@ function Dashboard({ result, onReset, onRefresh }: { result: AnalysisResult; onR
   };
   const suspects = result.suspects ?? [];
   const graph = result.graph ?? { nodes: [], edges: [] };
+  const [expandedDiffs, setExpandedDiffs] = useState<Set<string>>(new Set());
+  const [highlightFiles, setHighlightFiles] = useState<string[] | null>(null);
+
+  const toggleDiff = (sha: string) => {
+    setExpandedDiffs((prev) => {
+      const next = new Set(prev);
+      if (next.has(sha)) next.delete(sha);
+      else next.add(sha);
+      return next;
+    });
+  };
+
+  const showInDependencyMap = (files: string[]) => {
+    setHighlightFiles(files);
+    document.getElementById("dependency-map-section")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  // Reverse direction: clicking a file node in the dependency graph jumps
+  // to (and expands) the first suspect that actually touched that file, if
+  // any — <details> is a native element, so this just opens/scrolls it
+  // directly rather than threading suspect-open state through props.
+  const jumpToSuspectForFile = (path: string) => {
+    const match = suspects.find((s) => (s.affected_files ?? []).includes(path));
+    if (!match) return;
+    const el = document.getElementById(`suspect-${match.commit_sha}`);
+    if (el instanceof HTMLDetailsElement) el.open = true;
+    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
   const testFrameworks = result.test_frameworks ?? [];
   const dependencyFiles = result.dependency_files ?? [];
   const language = result.language ?? { dominant_language: "Unknown" };
@@ -300,7 +329,7 @@ function Dashboard({ result, onReset, onRefresh }: { result: AnalysisResult; onR
           <div style={{ color: "var(--dim)", fontSize: 13 }}>No commits crossed the diagnostic confidence threshold.</div>
         )}
         {suspects.map((s) => (
-          <details key={s.commit_sha} className="suspect-row" style={{ marginBottom: 10, border: "1px solid var(--hairline)", borderRadius: 4, padding: "10px 14px" }}>
+          <details id={`suspect-${s.commit_sha}`} key={s.commit_sha} className="suspect-row" style={{ marginBottom: 10, border: "1px solid var(--hairline)", borderRadius: 4, padding: "10px 14px" }}>
             <summary style={{ cursor: "pointer", display: "flex", justifyContent: "space-between" }}>
               <span>
                 <span style={{ color: "var(--found)", fontFamily: "var(--font-mono)" }}>{s.short_sha}</span>{" — "}
@@ -311,6 +340,27 @@ function Dashboard({ result, onReset, onRefresh }: { result: AnalysisResult; onR
             <div style={{ marginTop: 10 }}>
               {(s.evidence ?? []).map((e, i) => <EvidenceTag item={e} key={i} />)}
             </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+              <button
+                className="btn-ghost"
+                onClick={(e) => { e.preventDefault(); toggleDiff(s.commit_sha); }}
+                style={{ fontSize: 11, background: "transparent", color: "var(--dim)", border: "1px solid var(--hairline)", borderRadius: 3, padding: "3px 10px" }}
+              >
+                {expandedDiffs.has(s.commit_sha) ? "Hide diff" : "Show diff"}
+              </button>
+              {(s.affected_files ?? []).length > 0 && (
+                <button
+                  className="btn-ghost"
+                  onClick={(e) => { e.preventDefault(); showInDependencyMap(s.affected_files); }}
+                  style={{ fontSize: 11, background: "transparent", color: "var(--dim)", border: "1px solid var(--hairline)", borderRadius: 3, padding: "3px 10px" }}
+                >
+                  Show in dependency map
+                </button>
+              )}
+            </div>
+            {expandedDiffs.has(s.commit_sha) && (
+              <CommitDiffView analysisId={result.id} sha={s.commit_sha} />
+            )}
           </details>
         ))}
       </Section>
@@ -345,8 +395,8 @@ function Dashboard({ result, onReset, onRefresh }: { result: AnalysisResult; onR
         <EvidenceGraphView analysisId={result.id} nodes={graph.nodes} edges={graph.edges} onCounterfactualComplete={onRefresh} />
       </Section>
 
-      <Section title="DEPENDENCY MAP">
-        <CodeGraphView analysisId={result.id} />
+      <Section title="DEPENDENCY MAP" id="dependency-map-section">
+        <CodeGraphView analysisId={result.id} highlightFiles={highlightFiles} onFileNodeClick={jumpToSuspectForFile} />
       </Section>
     </div>
   );
@@ -383,9 +433,9 @@ function StatCard({ label, value, color }: { label: string; value: string; color
   );
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+function Section({ title, children, id }: { title: string; children: React.ReactNode; id?: string }) {
   return (
-    <div style={{ marginBottom: 28 }}>
+    <div id={id} style={{ marginBottom: 28 }}>
       <div className="mono-label" style={{ marginBottom: 12, color: "var(--glow)" }}>{title}</div>
       <div data-panel style={{ background: "var(--panel)", border: "1px solid var(--hairline)", borderRadius: 4, padding: 20 }}>
         {children}

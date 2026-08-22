@@ -9,7 +9,7 @@ import {
 
 const KIND_COLOR: Record<string, string> = {
   commit: "var(--tag-fact)",
-  file: "var(--paper-dim)",
+  file: "var(--dim)",
   function: "var(--tag-inference)",
   dependency: "var(--tag-evidence)",
   test: "var(--tag-recommendation)",
@@ -67,7 +67,7 @@ function RawOutputToggle({ baseline, withoutCommit }: { baseline: string; withou
           fontFamily: "var(--font-mono)",
           background: "none",
           border: "none",
-          color: "var(--paper-dim)",
+          color: "var(--dim)",
           cursor: "pointer",
           textDecoration: "underline",
           padding: 0,
@@ -77,7 +77,7 @@ function RawOutputToggle({ baseline, withoutCommit }: { baseline: string; withou
       </button>
       {open && (
         <div style={{ marginTop: 6 }}>
-          <div style={{ fontSize: 11, color: "var(--paper-dim)", marginBottom: 2 }}>With commit:</div>
+          <div style={{ fontSize: 11, color: "var(--dim)", marginBottom: 2 }}>With commit:</div>
           <pre
             style={{
               fontSize: 10,
@@ -93,7 +93,7 @@ function RawOutputToggle({ baseline, withoutCommit }: { baseline: string; withou
           >
             {baseline || "(no output captured)"}
           </pre>
-          <div style={{ fontSize: 11, color: "var(--paper-dim)", margin: "6px 0 2px" }}>Without commit:</div>
+          <div style={{ fontSize: 11, color: "var(--dim)", margin: "6px 0 2px" }}>Without commit:</div>
           <pre
             style={{
               fontSize: 10,
@@ -191,7 +191,7 @@ function CounterfactualPanel({
 
       {!job && (
         <>
-          <div style={{ fontSize: 12, color: "var(--paper-dim)", marginBottom: 8 }}>
+          <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 8 }}>
             Re-runs the test suite with this commit reverted, to check whether removing it
             actually eliminates a failing test — a verified result, not a heuristic.
           </div>
@@ -204,7 +204,7 @@ function CounterfactualPanel({
               padding: "6px 10px",
               borderRadius: 3,
               border: "1px solid var(--hairline)",
-              background: "var(--panel-raised)",
+              background: "var(--panel-lit)",
               color: "var(--paper)",
               cursor: starting ? "default" : "pointer",
               opacity: starting ? 0.6 : 1,
@@ -219,7 +219,7 @@ function CounterfactualPanel({
       )}
 
       {job && (job.status === "queued" || job.status === "running") && (
-        <div style={{ fontSize: 12, color: "var(--paper-dim)" }}>
+        <div style={{ fontSize: 12, color: "var(--dim)" }}>
           {job.status === "queued" ? "Queued..." : "Running test suite with and without this commit..."}
         </div>
       )}
@@ -237,7 +237,7 @@ function CounterfactualPanel({
             padding: 8,
             borderRadius: 3,
             border: `1px solid ${job.result.removes_failure ? "#c24a3f" : "var(--hairline)"}`,
-            background: job.result.removes_failure ? "rgba(194,74,63,0.08)" : "var(--panel-raised)",
+            background: job.result.removes_failure ? "rgba(194,74,63,0.08)" : "var(--panel-lit)",
           }}
         >
           <div style={{ fontWeight: 600, marginBottom: 4, color: job.result.removes_failure ? "#c24a3f" : "var(--paper)" }}>
@@ -245,16 +245,16 @@ function CounterfactualPanel({
               ? "Confirmed — reverting this commit eliminates the failure"
               : "Not confirmed — reverting this commit did not eliminate the failure"}
           </div>
-          <div style={{ color: "var(--paper-dim)" }}>
+          <div style={{ color: "var(--dim)" }}>
             Framework: {job.result.framework}
           </div>
           {job.result.baseline_failing_tests.length > 0 && (
-            <div style={{ color: "var(--paper-dim)", marginTop: 4 }}>
+            <div style={{ color: "var(--dim)", marginTop: 4 }}>
               Failing with commit: {job.result.baseline_failing_tests.join(", ")}
             </div>
           )}
           {job.result.without_commit_failing_tests.length > 0 && (
-            <div style={{ color: "var(--paper-dim)", marginTop: 2 }}>
+            <div style={{ color: "var(--dim)", marginTop: 2 }}>
               Still failing without commit: {job.result.without_commit_failing_tests.join(", ")}
             </div>
           )}
@@ -341,7 +341,7 @@ export function EvidenceGraphView({
       <div>
         {Object.entries(grouped).map(([kind, kindNodes]) => (
           <div key={kind} style={{ marginBottom: 16 }}>
-            <div className="mono-label" style={{ marginBottom: 8, color: KIND_COLOR[kind] || "var(--paper-dim)" }}>
+            <div className="mono-label" style={{ marginBottom: 8, color: KIND_COLOR[kind] || "var(--dim)" }}>
               {kind} · {kindNodes.length}
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
@@ -355,8 +355,8 @@ export function EvidenceGraphView({
                     onClick={() => setSelected(n.id)}
                     title={n.id}
                     style={{
-                      background: selected === n.id ? (KIND_COLOR[kind] || "#666") : "var(--panel-raised)",
-                      color: selected === n.id ? "var(--ink)" : "var(--paper)",
+                      background: selected === n.id ? (KIND_COLOR[kind] || "#666") : "var(--panel-lit)",
+                      color: selected === n.id ? "var(--bg)" : "var(--paper)",
                       border: `${ring ? 2 : 1}px solid ${ring || KIND_COLOR[kind] || "var(--hairline)"}`,
                       borderRadius: 3,
                       padding: "4px 8px",
@@ -375,7 +375,7 @@ export function EvidenceGraphView({
                 );
               })}
               {kindNodes.length > 60 && (
-                <span style={{ fontSize: 11, color: "var(--paper-dim)", alignSelf: "center" }}>
+                <span style={{ fontSize: 11, color: "var(--dim)", alignSelf: "center" }}>
                   +{kindNodes.length - 60} more
                 </span>
               )}
@@ -398,7 +398,7 @@ export function EvidenceGraphView({
       >
         <div className="mono-label" style={{ marginBottom: 10 }}>Evidence for node</div>
         {!selected && (
-          <div style={{ color: "var(--paper-dim)", fontSize: 13 }}>
+          <div style={{ color: "var(--dim)", fontSize: 13 }}>
             Click any node on the left to inspect its supporting evidence — every incoming and
             outgoing relationship recorded in the graph. Commit nodes with a confidence percentage
             are ranked suspects; darker borders mean higher confidence.
@@ -427,7 +427,7 @@ export function EvidenceGraphView({
                 style={{
                   fontSize: 12,
                   color: "var(--paper)",
-                  background: "var(--panel-raised)",
+                  background: "var(--panel-lit)",
                   border: "1px solid var(--hairline)",
                   borderRadius: 3,
                   padding: 8,
@@ -447,7 +447,7 @@ export function EvidenceGraphView({
             )}
 
             <div className="mono-label" style={{ marginTop: 12, marginBottom: 6 }}>Incoming ({incoming.length})</div>
-            {incoming.length === 0 && <div style={{ fontSize: 12, color: "var(--paper-dim)" }}>None recorded.</div>}
+            {incoming.length === 0 && <div style={{ fontSize: 12, color: "var(--dim)" }}>None recorded.</div>}
             {incoming.map((e, i) => {
               const causal = CAUSAL_EDGE_KINDS.has(e.kind);
               return (
@@ -461,13 +461,13 @@ export function EvidenceGraphView({
                   }}
                 >
                   <span style={{ color: causal ? "var(--tag-evidence)" : "var(--tag-fact)" }}>{e.kind}</span>{" "}
-                  <span style={{ color: "var(--paper-dim)" }}>from</span>{" "}
+                  <span style={{ color: "var(--dim)" }}>from</span>{" "}
                   {label(nodesById[e.source] || { id: e.source, kind: "" })}
                 </div>
               );
             })}
             <div className="mono-label" style={{ marginTop: 12, marginBottom: 6 }}>Outgoing ({outgoing.length})</div>
-            {outgoing.length === 0 && <div style={{ fontSize: 12, color: "var(--paper-dim)" }}>None recorded.</div>}
+            {outgoing.length === 0 && <div style={{ fontSize: 12, color: "var(--dim)" }}>None recorded.</div>}
             {outgoing.map((e, i) => {
               const causal = CAUSAL_EDGE_KINDS.has(e.kind);
               return (
@@ -481,7 +481,7 @@ export function EvidenceGraphView({
                   }}
                 >
                   <span style={{ color: causal ? "var(--tag-evidence)" : "var(--tag-fact)" }}>{e.kind}</span>{" "}
-                  <span style={{ color: "var(--paper-dim)" }}>to</span>{" "}
+                  <span style={{ color: "var(--dim)" }}>to</span>{" "}
                   {label(nodesById[e.target] || { id: e.target, kind: "" })}
                 </div>
               );

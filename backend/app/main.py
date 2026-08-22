@@ -18,7 +18,7 @@ from app.pipeline import run_analysis
 from app.security import InvalidRepositoryURL, validate_github_url
 from app.analysis import badge
 from app.analysis import git_history
-from app.analysis.evidence_graph import evidence_for_node_json
+from app.analysis.evidence_graph import evidence_for_node_json, find_import_cycles
 from app.analysis import counterfactual
 from app.analysis import regression_detection
 from app.analysis.cloner import CloneError, clone_repository, cleanup_workdir
@@ -357,7 +357,7 @@ def get_code_graph(analysis_id: str, db: Session = Depends(get_session)):
         seen.add(key)
         edges.append(e)
 
-    return {"nodes": nodes, "edges": edges}
+    return {"nodes": nodes, "edges": edges, "cycles": find_import_cycles(graph)}
 
 
 @app.get("/api/analysis/{analysis_id}/commit/{sha}/diff")

@@ -307,42 +307,42 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
 
   if (error) return <div style={{ color: "#c24a3f", fontSize: 13 }}>{error}</div>;
   if (!raw || !capped || !positions) {
-    return <div style={{ color: "var(--paper-dim)", fontSize: 13 }}>Loading dependency graph...</div>;
+    return <div style={{ color: "var(--dim)", fontSize: 13 }}>Loading dependency graph...</div>;
   }
 
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 16, marginBottom: 10, fontSize: 11 }}>
-        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", color: "var(--paper-dim)" }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", color: "var(--dim)" }}>
           <input type="checkbox" checked={showFunctions} onChange={(e) => setShowFunctions(e.target.checked)} />
           Show functions
         </label>
-        <span style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--paper-dim)" }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--dim)" }}>
           <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--tag-fact)", display: "inline-block" }} />
           file
         </span>
-        <span style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--paper-dim)" }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--dim)" }}>
           <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--tag-recommendation)", display: "inline-block" }} />
           test file
         </span>
         {showFunctions && (
-          <span style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--paper-dim)" }}>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--dim)" }}>
             <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--tag-inference)", display: "inline-block" }} />
             function
           </span>
         )}
-        <span style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--paper-dim)" }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--dim)" }}>
           <span style={{ width: 14, height: 1, background: "var(--tag-evidence)", display: "inline-block" }} />
           imports
         </span>
-        <span style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--paper-dim)" }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--dim)" }}>
           <span style={{ width: 14, height: 1, background: "var(--dim)", display: "inline-block" }} />
           calls
         </span>
         <button
           onClick={() => setTransform({ x: 0, y: 0, k: 1 })}
           style={{
-            marginLeft: "auto", fontSize: 11, background: "transparent", color: "var(--paper-dim)",
+            marginLeft: "auto", fontSize: 11, background: "transparent", color: "var(--dim)",
             border: "1px solid var(--hairline)", borderRadius: 3, padding: "2px 8px", cursor: "pointer",
           }}
         >
@@ -367,20 +367,42 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
           if (e.target === e.currentTarget) setSelected(null);
         }}
       >
+        <defs>
+          {Object.entries(EDGE_COLOR).map(([kind, color]) => (
+            <marker
+              key={kind}
+              id={`arrow-${kind}`}
+              viewBox="0 0 10 10"
+              refX="9" refY="5"
+              markerWidth="6" markerHeight="6"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 0 L 10 5 L 0 10 z" fill={color} />
+            </marker>
+          ))}
+        </defs>
         <g transform={`translate(${transform.x},${transform.y}) scale(${transform.k})`}>
           {capped.edges.map((e, i) => {
             const a = nodesById[e.source];
             const b = nodesById[e.target];
             if (!a || !b) return null;
             const dim = connected && !(connected.has(e.source) && connected.has(e.target));
+            const active = connected && connected.has(e.source) && connected.has(e.target);
+            // shorten the line so the arrowhead sits at the target node's
+            // rim instead of under it
+            const dx = b.x - a.x, dy = b.y - a.y;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            const pad = e.kind === "FILE_CONTAINS_FUNCTION" ? 0 : 7;
+            const ex = b.x - (dx / len) * pad, ey = b.y - (dy / len) * pad;
             return (
               <line
                 key={i}
-                x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+                x1={a.x} y1={a.y} x2={ex} y2={ey}
                 stroke={EDGE_COLOR[e.kind] || "var(--hairline)"}
-                strokeWidth={(e.kind === "IMPORTS" ? 1 : 0.6) / transform.k}
-                opacity={dim ? 0.06 : e.kind === "FILE_CONTAINS_FUNCTION" ? 0.25 : 0.5}
-                style={{ transition: "opacity 120ms ease" }}
+                strokeWidth={((e.kind === "IMPORTS" ? 1.1 : 0.7) * (active ? 1.8 : 1)) / transform.k}
+                opacity={dim ? 0.06 : e.kind === "FILE_CONTAINS_FUNCTION" ? 0.25 : active ? 0.9 : 0.5}
+                markerEnd={e.kind === "FILE_CONTAINS_FUNCTION" ? undefined : `url(#arrow-${e.kind})`}
+                style={{ transition: "opacity 150ms ease, stroke-width 150ms ease" }}
               />
             );
           })}
@@ -394,7 +416,7 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
               <g
                 key={n.id}
                 transform={`translate(${n.x},${n.y})`}
-                style={{ cursor: "pointer" }}
+                style={{ cursor: "pointer", color }}
                 opacity={dim ? 0.2 : 1}
                 onPointerDown={(e) => {
                   e.stopPropagation();
@@ -407,14 +429,31 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
                   setSelected(n.id === selected ? null : n.id);
                 }}
               >
-                <circle r={r} fill={color} stroke="var(--panel)" strokeWidth={1.5 / transform.k}
-                  style={{ transition: "r 120ms ease" }} />
+                {selected === n.id && (
+                  <circle
+                    r={r + 5 / transform.k}
+                    fill="none"
+                    stroke={color}
+                    strokeWidth={1 / transform.k}
+                    className="status-pulse"
+                  />
+                )}
+                <circle
+                  r={r}
+                  fill={color}
+                  stroke="var(--panel)"
+                  strokeWidth={1.5 / transform.k}
+                  style={{
+                    transition: "r 150ms ease, filter 150ms ease",
+                    filter: focused ? "drop-shadow(0 0 5px currentColor)" : "drop-shadow(0 0 1.5px currentColor)",
+                  }}
+                />
                 {showLabel && (
                   <text
                     x={9 / transform.k} y={3 / transform.k}
                     fontFamily="var(--font-mono)"
                     fontSize={10 / transform.k}
-                    fill={focused ? "var(--paper)" : "var(--paper-dim)"}
+                    fill={focused ? "var(--paper)" : "var(--dim)"}
                   >
                     {n.label}
                   </text>
@@ -424,7 +463,7 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
           })}
         </g>
       </svg>
-      <div style={{ fontSize: 11, color: "var(--paper-dim)", marginTop: 6 }}>
+      <div style={{ fontSize: 11, color: "var(--dim)", marginTop: 6 }}>
         {capped.nodes.length} nodes, {capped.edges.length} edges
         {capped.totalBeforeCap > capped.nodes.length &&
           ` (showing the ${capped.nodes.length} most-connected of ${capped.totalBeforeCap})`}
@@ -433,4 +472,4 @@ export function CodeGraphView({ analysisId }: { analysisId: string }) {
       </div>
     </div>
   );
-}  
+}

@@ -139,10 +139,32 @@ export async function getCounterfactualJob(jobId: string): Promise<Counterfactua
 export interface CodeGraph {
   nodes: GraphNode[];
   edges: GraphEdge[];
+  cycles: string[][];
 }
 
 export async function getCodeGraph(analysisId: string): Promise<CodeGraph> {
   const resp = await fetch(`${BASE}/analysis/${analysisId}/code-graph`);
   if (!resp.ok) throw new Error("Failed to fetch code dependency graph.");
+  return resp.json();
+}
+
+// --- Commit diff -----------------------------------------------------------
+//
+// Mirrors main.py's GET /api/analysis/{id}/commit/{sha}/diff. Re-clones the
+// repo on the backend to read it (the repo isn't kept around after the
+// analysis pipeline finishes), so this can be slower than other endpoints
+// and is rate-limited server-side the same way analysis starts are.
+
+export interface CommitDiff {
+  sha: string;
+  diff: string;
+}
+
+export async function getCommitDiff(analysisId: string, sha: string): Promise<CommitDiff> {
+  const resp = await fetch(`${BASE}/analysis/${analysisId}/commit/${sha}/diff`);
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({ detail: resp.statusText }));
+    throw new Error(body.detail || "Failed to fetch commit diff.");
+  }
   return resp.json();
 }
